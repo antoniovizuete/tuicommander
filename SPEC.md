@@ -1,7 +1,7 @@
 # TUICommander Specification
 
-**Version:** 0.8.2
-**Last Updated:** 2026-03-11
+**Version:** 0.9.0
+**Last Updated:** 2026-03-14
 
 ## Overview
 
@@ -45,9 +45,9 @@ App
 │   └── Terminal Tabs
 ├── Terminal Container
 │   ├── Terminal (xterm.js)
-│   ├── DiffPanel
 │   ├── MarkdownPanel
 │   └── IdeasPanel
+├── GitPanel (side panel)
 ├── StatusBar
 ├── PromptOverlay
 └── PromptDrawer
@@ -206,7 +206,7 @@ Features:
 | Cmd+T | New terminal |
 | Cmd+W | Close terminal |
 | Cmd+K | Open prompt library |
-| Cmd+Shift+D | Toggle diff panel |
+| Cmd+Shift+D | Toggle Git Panel |
 | Cmd+M | Toggle markdown panel |
 | Cmd+N | Toggle Ideas panel |
 | Cmd+1-9 | Switch to tab N |
@@ -217,7 +217,6 @@ Features:
 | Cmd+[ | Toggle sidebar |
 | Cmd+? | Toggle help panel |
 | Cmd+G | Open lazygit |
-| Cmd+Shift+G | Git operations panel |
 | Cmd+Shift+L | Lazygit split pane |
 | Cmd+Shift+[ | Previous tab |
 | Cmd+Shift+] | Next tab |
@@ -281,8 +280,8 @@ All stores persist to localStorage:
 - [x] Lazygit integration (inline, split pane, floating window)
 - [x] Lazy terminal restore (sessions materialize on branch click, not app startup)
 - [x] Windows compatibility (shell escaping, process detection, resolve_cli, IDE detection)
-- [x] Repo watcher for automatic GitOperationsPanel refresh
-- [x] Git Operations Panel v2 (status card, background exec, BranchCombobox, create branch, rebase/cherry-pick UI)
+- [x] Repo watcher for automatic panel refresh on `.git/` changes
+- [x] Git Panel (3 tabs: Changes with History/Blame sub-panels, Log with canvas commit graph, Stashes) — replaces Git Operations Panel and DiffPanel
 - [x] Context menu submenus and "New Group..." via PromptDialog
 - [x] File Browser panel (`Cmd+E`)
 - [x] CodeMirror code editor
@@ -301,6 +300,7 @@ All stores persist to localStorage:
 - [x] Status bar unified agent badge with priority cascade (rate limit > usage API > PTY usage > name)
 - [x] PR lifecycle filtering (CLOSED hidden, MERGED hidden after 5min user activity)
 - [x] Notes/Ideas: mark as used, badge count in status bar
+- [x] Notes/Ideas: image paste support (Ctrl+V), thumbnails, send absolute paths to terminal
 
 ### Completed (Voice Dictation)
 - [x] Local Whisper inference via whisper-rs (Metal GPU acceleration)

@@ -1,4 +1,4 @@
-import { Component, For, Show, createSignal } from "solid-js";
+import { Component, For, Show, createSignal, createMemo } from "solid-js";
 import { getModifierSymbol, isMacOS } from "../../../platform";
 import { t } from "../../../i18n";
 import { keybindingsStore } from "../../../stores/keybindings";
@@ -58,7 +58,6 @@ function getShortcutSections(): ShortcutSection[] {
   {
     title: t("helpPanel.panels", "Panels"),
     shortcuts: [
-      { action: "toggle-diff", keys: keyFor("toggle-diff"), description: t("helpPanel.toggleDiffPanel", "Toggle git diff panel") },
       { action: "toggle-markdown", keys: keyFor("toggle-markdown"), description: t("helpPanel.toggleMarkdownPanel", "Toggle markdown panel") },
       { action: "toggle-settings", keys: keyFor("toggle-settings"), description: t("helpPanel.openSettings", "Open settings") },
       { action: "toggle-task-queue", keys: keyFor("toggle-task-queue"), description: t("helpPanel.toggleTaskQueue", "Toggle task queue") },
@@ -73,7 +72,7 @@ function getShortcutSections(): ShortcutSection[] {
     title: t("helpPanel.git", "Git"),
     shortcuts: [
       { action: "open-lazygit", keys: keyFor("open-lazygit"), description: t("helpPanel.openLazygit", "Open lazygit in terminal") },
-      { action: "toggle-git-ops", keys: keyFor("toggle-git-ops"), description: t("helpPanel.gitOperationsPanel", "Git operations panel") },
+      { action: "toggle-git-ops", keys: keyFor("toggle-git-ops"), description: t("helpPanel.gitPanel", "Git Panel") },
       { action: "open-lazygit-pane", keys: keyFor("open-lazygit-pane"), description: t("helpPanel.lazygitSplitPane", "Lazygit split pane") },
     ],
   },
@@ -139,7 +138,7 @@ export const KeyboardShortcutsTab: Component = () => {
   const [conflict, setConflict] = createSignal<{ action: ActionName; combo: string } | null>(null);
   let inputRef: HTMLInputElement | undefined;
 
-  const filteredSections = () => {
+  const filteredSections = createMemo(() => {
     // Read version for reactivity
     keybindingsStore.version;
     const q = filter().toLowerCase();
@@ -155,7 +154,7 @@ export const KeyboardShortcutsTab: Component = () => {
         ),
       }))
       .filter((section) => section.shortcuts.length > 0);
-  };
+  });
 
   function startEditing(action: ActionName) {
     setConflict(null);

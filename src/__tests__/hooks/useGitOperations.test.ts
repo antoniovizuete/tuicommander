@@ -370,7 +370,7 @@ describe("useGitOperations", () => {
       await gitOps.handleRemoveBranch("/repo", "feature");
 
       expect(mockDialogs.confirmRemoveWorktree).toHaveBeenCalledWith("feature");
-      expect(mockRepo.removeWorktree).toHaveBeenCalledWith("/repo", "feature", true);
+      expect(mockRepo.removeWorktree).toHaveBeenCalledWith("/repo", "feature", true, undefined);
       expect(repositoriesStore.get("/repo")?.branches["feature"]).toBeUndefined();
     });
 
@@ -383,7 +383,7 @@ describe("useGitOperations", () => {
 
       await gitOps.handleRemoveBranch("/repo", "feature");
 
-      expect(mockRepo.removeWorktree).toHaveBeenCalledWith("/repo", "feature", false);
+      expect(mockRepo.removeWorktree).toHaveBeenCalledWith("/repo", "feature", false, undefined);
     });
 
     it("rejects removal of non-worktree branch", async () => {
@@ -617,7 +617,7 @@ describe("useGitOperations", () => {
 
       expect(mockRepo.mergePrViaGithub).toHaveBeenCalledWith("/repo", 99, "squash");
       expect(mockRepo.mergeAndArchiveWorktree).not.toHaveBeenCalled();
-      expect(mockRepo.finalizeMergedWorktree).toHaveBeenCalledWith("/repo", "feature/x", "archive");
+      expect(mockRepo.finalizeMergedWorktree).toHaveBeenCalledWith("/repo", "feature/x", "archive", undefined);
     });
 
     it("falls back to local git merge when GitHub API fails", async () => {
@@ -627,7 +627,7 @@ describe("useGitOperations", () => {
       await gitOps.handleMergeAndArchive("/repo", "feature/x", "main", "archive");
 
       expect(mockRepo.mergePrViaGithub).toHaveBeenCalled();
-      expect(mockRepo.mergeAndArchiveWorktree).toHaveBeenCalledWith("/repo", "feature/x", "main", "archive");
+      expect(mockRepo.mergeAndArchiveWorktree).toHaveBeenCalledWith("/repo", "feature/x", "main", "archive", undefined);
     });
 
     it("sets mergePendingCtx when afterMerge=ask with GitHub PR merge", async () => {
@@ -924,7 +924,7 @@ describe("useGitOperations", () => {
 
       await gitOps.refreshAllBranchStats();
 
-      expect(mockRepo.finalizeMergedWorktree).toHaveBeenCalledWith("/repo", "merged-branch", "archive");
+      expect(mockRepo.finalizeMergedWorktree).toHaveBeenCalledWith("/repo", "merged-branch", "archive", undefined);
       expect(archiveCalledBeforeDiffStats).toBe(true);
     });
   });
@@ -1739,6 +1739,43 @@ describe("useGitOperations", () => {
       expect(mockRepo.removeOrphanWorktree).not.toHaveBeenCalled();
     });
 
+    it("suppresses duplicate dialog when two repos have orphans in same refresh", async () => {
+      // Two repos processed in parallel by Promise.all — both have orphans.
+      // The second should see orphanDialogOpen=true and skip.
+      repositoriesStore.add({ path: "/repo2", displayName: "Repo2" });
+      repositoriesStore.setBranch("/repo2", "main", { worktreePath: "/repo2" });
+
+      let resolveDialog!: (value: boolean) => void;
+      const confirmOrphanCleanup = vi.fn().mockImplementation(
+        () => new Promise<boolean>((r) => { resolveDialog = r; }),
+      );
+      const askGitOps = useGitOperations({
+        repo: mockRepo,
+        pty: mockPty,
+        dialogs: { ...mockDialogs, confirmOrphanCleanup },
+        closeTerminal: mockCloseTerminal,
+        createNewTerminal: mockCreateNewTerminal,
+        setStatusInfo: mockSetStatusInfo,
+        getDefaultFontSize: () => 14,
+        getMaxTabNameLength: () => 25,
+      });
+
+      mockRepo.getRepoStructure.mockResolvedValue({ worktree_paths: { main: "/repo" }, merged_branches: [] });
+      mockRepo.getRepoDiffStats.mockResolvedValue({ diff_stats: {}, last_commit_ts: {} });
+      mockRepo.detectOrphanWorktrees.mockResolvedValue(["/wt/detached-1"]);
+
+      // Single refresh processes both repos in parallel via Promise.all
+      const p = askGitOps.refreshAllBranchStats();
+
+      // Yield microtasks so both repos reach handleOrphanCleanup
+      await new Promise((r) => setTimeout(r, 0));
+      resolveDialog(true);
+      await p;
+
+      // Dialog should only have been shown once despite two repos having orphans
+      expect(confirmOrphanCleanup).toHaveBeenCalledTimes(1);
+    });
+
     it("does nothing when no orphans found", async () => {
       repoSettingsStore.getOrCreate("/repo", "Repo");
       repoSettingsStore.update("/repo", { orphanCleanup: "on" });
@@ -1768,7 +1805,7 @@ describe("useGitOperations", () => {
 
       await gitOps.refreshAllBranchStats();
 
-      expect(mockRepo.finalizeMergedWorktree).toHaveBeenCalledWith("/repo", "feature/x", "archive");
+      expect(mockRepo.finalizeMergedWorktree).toHaveBeenCalledWith("/repo", "feature/x", "archive", undefined);
       expect(mockSetStatusInfo).toHaveBeenCalledWith("Auto-archived 1 merged worktree(s)");
     });
 

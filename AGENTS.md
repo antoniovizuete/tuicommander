@@ -217,7 +217,13 @@ createEffect(() => {
 
 ## Architecture Rule: Logic in Rust
 
-**All business logic, data transformation, and parsing MUST be implemented in Rust (backend), NOT in the UI layer (TypeScript/SolidJS stores or components).** The frontend should only handle rendering and user interaction — never data reshaping or computation.
+**All business logic, data transformation, parsing, and script execution MUST be implemented in Rust (backend), NOT in the UI layer (TypeScript/SolidJS stores or components).** The frontend handles ONLY rendering and user interaction — never data reshaping, computation, or process orchestration.
+
+Concrete examples:
+- Script execution (setup, run, archive hooks) → Rust runs `sh -c` / `cmd /C`
+- Config merging / effective-settings resolution → Rust when possible
+- Git operations, file I/O, process spawning → always Rust
+- Frontend passes inputs to Tauri commands; Rust decides and acts
 
 ## Debugging: App Log Access
 
@@ -230,6 +236,18 @@ createEffect(() => {
 - Filters can be combined: `GET /logs?level=warn&source=git&limit=20`
 
 Use this **before asking Boss** to paste logs — check the ring buffer yourself first.
+
+## Logging Rule: Always Use appLogger
+
+**NEVER use `console.log`, `console.warn`, or `console.error` directly in application code.** Always use `appLogger` from `src/stores/appLogger.ts`. It writes to the centralized ring-buffer log store, forwards to the browser console automatically, and surfaces errors in the ErrorLogPanel — visible without opening DevTools.
+
+```typescript
+import { appLogger } from "../stores/appLogger";
+
+appLogger.info("plugin", "Plan loaded", { path });
+appLogger.warn("git", "Stale worktree reference");
+appLogger.error("network", "GitHub API failed", err);
+```
 
 ## Release & Tag Checklist
 

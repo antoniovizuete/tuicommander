@@ -109,12 +109,11 @@ export const GeneralTab: Component = () => {
           onChange={(e) => settingsStore.setUpdateChannel(e.currentTarget.value as UpdateChannel)}
         >
           <option value="stable">{t("general.channel.stable", "Stable")}</option>
-          <option value="beta">{t("general.channel.beta", "Beta")}</option>
           <option value="nightly">{t("general.channel.nightly", "Nightly")}</option>
         </select>
         <Show when={settingsStore.state.updateChannel !== "stable"}>
           <p class={s.hint} style={{ color: "var(--warning, #e5c07b)" }}>
-            {t("general.hint.updateChannelWarning", "Beta and nightly builds may be unstable")}
+            {t("general.hint.updateChannelWarning", "Nightly builds may be unstable")}
           </p>
         </Show>
         <Show when={settingsStore.state.updateChannel === "stable"}>
@@ -225,6 +224,17 @@ export const GeneralTab: Component = () => {
           rows={4}
         />
         <p class={s.hint}>{t("general.hint.defaultRunScript", "Shell script run when launching the worktree")}</p>
+      </div>
+
+      <div class={s.group}>
+        <label>{t("general.label.defaultArchiveScript", "Default Archive Script")}</label>
+        <textarea
+          value={repoDefaultsStore.state.archiveScript}
+          onInput={(e) => repoDefaultsStore.setArchiveScript(e.currentTarget.value)}
+          placeholder="#!/bin/bash&#10;docker compose down"
+          rows={4}
+        />
+        <p class={s.hint}>{t("general.hint.defaultArchiveScript", "Shell script run before archiving or deleting a worktree")}</p>
       </div>
 
       <h3>{t("general.heading.worktreeDefaults", "Worktree Defaults")}</h3>

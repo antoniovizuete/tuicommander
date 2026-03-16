@@ -14,6 +14,7 @@ const mockDefaults = {
   copyUntrackedFiles: false,
   setupScript: "",
   runScript: "",
+  archiveScript: "",
 };
 
 vi.mock("../../stores/repoDefaults", () => ({
@@ -35,6 +36,7 @@ describe("repoSettingsStore", () => {
       copyUntrackedFiles: false,
       setupScript: "",
       runScript: "",
+      archiveScript: "",
     });
 
     vi.doMock("@tauri-apps/api/core", () => ({
@@ -190,6 +192,27 @@ describe("repoSettingsStore", () => {
       });
     });
 
+    it("returns archiveScript from global default when not overridden", () => {
+      createRoot((dispose) => {
+        store.getOrCreate("/repo", "my-repo");
+        mockDefaults.archiveScript = "cleanup.sh";
+        const effective = store.getEffective("/repo");
+        expect(effective!.archiveScript).toBe("cleanup.sh");
+        dispose();
+      });
+    });
+
+    it("uses per-repo archiveScript override when set", () => {
+      createRoot((dispose) => {
+        store.getOrCreate("/repo", "my-repo");
+        store.update("/repo", { archiveScript: "my-cleanup.sh" });
+        mockDefaults.archiveScript = "global-cleanup.sh";
+        const effective = store.getEffective("/repo");
+        expect(effective!.archiveScript).toBe("my-cleanup.sh");
+        dispose();
+      });
+    });
+
     it("preserves non-overridable fields (path, displayName, color)", () => {
       createRoot((dispose) => {
         store.getOrCreate("/repo", "my-repo");
@@ -198,6 +221,83 @@ describe("repoSettingsStore", () => {
         expect(effective!.path).toBe("/repo");
         expect(effective!.displayName).toBe("my-repo");
         expect(effective!.color).toBe("#ff0000");
+        dispose();
+      });
+    });
+  });
+
+  describe("three-tier getEffective() with local config", () => {
+    it("uses .tuic.json values when per-repo setting is null", async () => {
+      await createRoot(async (dispose) => {
+        // Simulate Tauri returning a local config from .tuic.json
+        mockInvoke.mockImplementation(async (cmd: string) => {
+          if (cmd === "load_repo_local_config") {
+            return { base_branch: "develop", setup_script: "make setup" };
+          }
+          return undefined;
+        });
+
+        store.getOrCreate("/repo", "my-repo");
+        await store.loadLocalConfig("/repo");
+
+        const effective = store.getEffective("/repo");
+        expect(effective).toBeDefined();
+        // .tuic.json overrides global default
+        expect(effective!.baseBranch).toBe("develop");
+        expect(effective!.setupScript).toBe("make setup");
+        // Global default still applies for fields not in .tuic.json
+        expect(effective!.runScript).toBe(""); // from global default
+        dispose();
+      });
+    });
+
+    it("per-repo setting overrides .tuic.json", async () => {
+      await createRoot(async (dispose) => {
+        mockInvoke.mockImplementation(async (cmd: string) => {
+          if (cmd === "load_repo_local_config") {
+            return { base_branch: "develop", setup_script: "make setup" };
+          }
+          return undefined;
+        });
+
+        store.getOrCreate("/repo", "my-repo");
+        store.update("/repo", { baseBranch: "main" }); // per-repo override
+        await store.loadLocalConfig("/repo");
+
+        const effective = store.getEffective("/repo");
+        expect(effective).toBeDefined();
+        // per-repo overrides .tuic.json
+        expect(effective!.baseBranch).toBe("main");
+        // .tuic.json still wins over global for non-overridden fields
+        expect(effective!.setupScript).toBe("make setup");
+        dispose();
+      });
+    });
+
+    it("returns undefined for missing .tuic.json (no local config cached)", () => {
+      createRoot((dispose) => {
+        store.getOrCreate("/repo", "my-repo");
+        // No loadLocalConfig called — should fall back to two-tier
+        const effective = store.getEffective("/repo");
+        expect(effective).toBeDefined();
+        expect(effective!.baseBranch).toBe("automatic"); // global default
+        dispose();
+      });
+    });
+
+    it("handles null from Tauri (no .tuic.json file)", async () => {
+      await createRoot(async (dispose) => {
+        mockInvoke.mockImplementation(async (cmd: string) => {
+          if (cmd === "load_repo_local_config") return null;
+          return undefined;
+        });
+
+        store.getOrCreate("/repo", "my-repo");
+        await store.loadLocalConfig("/repo");
+
+        const effective = store.getEffective("/repo");
+        expect(effective).toBeDefined();
+        expect(effective!.baseBranch).toBe("automatic"); // global default
         dispose();
       });
     });

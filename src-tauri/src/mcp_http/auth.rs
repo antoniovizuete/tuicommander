@@ -108,7 +108,7 @@ fn session_cookie_value(token: &str, max_age_secs: u64) -> String {
 /// Check whether an IP address belongs to a private/LAN network.
 /// Covers RFC1918 (10/8, 172.16/12, 192.168/16), CGNAT/Tailscale (100.64/10),
 /// IPv6 ULA (fc00::/7), and IPv6 link-local (fe80::/10).
-pub(super) fn is_private_ip(ip: &IpAddr) -> bool {
+pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_private_ipv4(v4),
         IpAddr::V6(v6) => is_private_ipv6(v6),
@@ -314,6 +314,84 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert!(!has_valid_session_cookie(&req, "correct-token"));
+    }
+
+    // --- validate_basic_auth tests ---
+
+    fn basic_header(user: &str, pass: &str) -> String {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        format!("Basic {encoded}")
+    }
+
+    #[test]
+    fn basic_auth_valid_credentials() {
+        let hash = bcrypt::hash("secret123", 4).unwrap(); // cost=4 for fast tests
+        assert!(matches!(
+            validate_basic_auth(Some(&basic_header("admin", "secret123")), "admin", &hash),
+            AuthResult::Ok
+        ));
+    }
+
+    #[test]
+    fn basic_auth_wrong_password() {
+        let hash = bcrypt::hash("correct", 4).unwrap();
+        assert!(matches!(
+            validate_basic_auth(Some(&basic_header("admin", "wrong")), "admin", &hash),
+            AuthResult::Invalid
+        ));
+    }
+
+    #[test]
+    fn basic_auth_missing_header() {
+        let hash = bcrypt::hash("pass", 4).unwrap();
+        assert!(matches!(
+            validate_basic_auth(None, "admin", &hash),
+            AuthResult::MissingHeader
+        ));
+    }
+
+    #[test]
+    fn basic_auth_empty_config_not_configured() {
+        assert!(matches!(
+            validate_basic_auth(Some(&basic_header("admin", "pass")), "", ""),
+            AuthResult::NotConfigured
+        ));
+    }
+
+    #[test]
+    fn basic_auth_malformed_base64() {
+        assert!(matches!(
+            validate_basic_auth(Some("Basic !!!not-base64!!!"), "admin", "somehash"),
+            AuthResult::Invalid
+        ));
+    }
+
+    #[test]
+    fn basic_auth_wrong_username() {
+        let hash = bcrypt::hash("pass", 4).unwrap();
+        assert!(matches!(
+            validate_basic_auth(Some(&basic_header("hacker", "pass")), "admin", &hash),
+            AuthResult::Invalid
+        ));
+    }
+
+    #[test]
+    fn basic_auth_no_colon_separator() {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("nocolon");
+        assert!(matches!(
+            validate_basic_auth(Some(&format!("Basic {encoded}")), "admin", "somehash"),
+            AuthResult::Invalid
+        ));
+    }
+
+    #[test]
+    fn basic_auth_not_basic_scheme() {
+        assert!(matches!(
+            validate_basic_auth(Some("Bearer some-token"), "admin", "somehash"),
+            AuthResult::Invalid
+        ));
     }
 
     #[test]

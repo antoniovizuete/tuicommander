@@ -15,6 +15,43 @@ use std::path::{Component, Path, PathBuf};
 use tauri::http::{Response, StatusCode};
 use tauri::{AppHandle, Emitter};
 
+// ---------------------------------------------------------------------------
+// Capability enforcement
+// ---------------------------------------------------------------------------
+
+/// Check that a plugin has a required capability, using the provided map.
+/// This is the testable core — does not depend on AppState.
+fn check_plugin_capability_inner(
+    loaded_plugins: &dashmap::DashMap<String, Vec<String>>,
+    plugin_id: &str,
+    capability: &str,
+) -> Result<(), String> {
+    match loaded_plugins.get(plugin_id) {
+        Some(caps) => {
+            if caps.iter().any(|c| c == capability) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Plugin \"{plugin_id}\" requires capability \"{capability}\" but did not declare it"
+                ))
+            }
+        }
+        None => Err(format!(
+            "Plugin \"{plugin_id}\" is not registered — cannot verify capabilities"
+        )),
+    }
+}
+
+/// Check that a loaded plugin has the required capability.
+/// Reads the loaded_plugins map from AppState.
+pub(crate) fn check_plugin_capability(
+    state: &crate::AppState,
+    plugin_id: &str,
+    capability: &str,
+) -> Result<(), String> {
+    check_plugin_capability_inner(&state.loaded_plugins, plugin_id, capability)
+}
+
 /// Root directory for user plugins: `{config_dir}/plugins/`
 fn plugins_dir() -> PathBuf {
     config::config_dir().join("plugins")
@@ -175,12 +212,21 @@ fn resolve_plugin_path(uri_path: &str) -> Option<PathBuf> {
 pub fn register_plugin_protocol(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
     builder.register_uri_scheme_protocol("plugin", |_ctx, request| {
         let uri = request.uri();
+        // On macOS/Linux: plugin://my-plugin/main.js → host="my-plugin", path="/main.js"
+        // On Windows: http://plugin.localhost/my-plugin/main.js → host="plugin.localhost", path="/my-plugin/main.js"
+        let host = uri.host().unwrap_or("");
         let path = uri.path();
+        let combined = if host.is_empty() || host.ends_with(".localhost") {
+            path.to_string()
+        } else {
+            format!("/{host}{path}")
+        };
 
-        let Some(file_path) = resolve_plugin_path(path) else {
+        let Some(file_path) = resolve_plugin_path(&combined) else {
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header("Content-Type", "text/plain")
+                .header("Access-Control-Allow-Origin", "*")
                 .body(b"Invalid plugin path".to_vec())
                 .unwrap();
         };
@@ -198,12 +244,14 @@ pub fn register_plugin_protocol(builder: tauri::Builder<tauri::Wry>) -> tauri::B
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", mime)
+                    .header("Access-Control-Allow-Origin", "*")
                     .body(data)
                     .unwrap()
             }
             Err(_) => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("Content-Type", "text/plain")
+                .header("Access-Control-Allow-Origin", "*")
                 .body(b"Plugin file not found".to_vec())
                 .unwrap(),
         }
@@ -226,7 +274,7 @@ pub fn list_user_plugins() -> Vec<PluginManifest> {
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(err) => {
-            eprintln!("[plugins] Failed to read plugins dir: {err}");
+            tracing::warn!(source = "plugins", "Failed to read plugins dir: {err}");
             return Vec::new();
         }
     };
@@ -253,7 +301,7 @@ pub fn list_user_plugins() -> Vec<PluginManifest> {
         let manifest_data = match std::fs::read_to_string(&manifest_path) {
             Ok(d) => d,
             Err(err) => {
-                eprintln!("[plugins] {dir_name}: failed to read manifest.json: {err}");
+                tracing::warn!(source = "plugins", plugin = %dir_name, "Failed to read manifest.json: {err}");
                 continue;
             }
         };
@@ -261,13 +309,13 @@ pub fn list_user_plugins() -> Vec<PluginManifest> {
         let manifest: PluginManifest = match serde_json::from_str(&manifest_data) {
             Ok(m) => m,
             Err(err) => {
-                eprintln!("[plugins] {dir_name}: invalid manifest.json: {err}");
+                tracing::warn!(source = "plugins", plugin = %dir_name, "Invalid manifest.json: {err}");
                 continue;
             }
         };
 
         if let Err(err) = validate_manifest(&manifest, &dir_name) {
-            eprintln!("[plugins] {dir_name}: manifest validation failed: {err}");
+            tracing::warn!(source = "plugins", plugin = %dir_name, "Manifest validation failed: {err}");
             continue;
         }
 
@@ -275,6 +323,50 @@ pub fn list_user_plugins() -> Vec<PluginManifest> {
     }
 
     manifests
+}
+
+// ---------------------------------------------------------------------------
+// Plugin capability registration (called by frontend on plugin load)
+// ---------------------------------------------------------------------------
+
+/// Register a plugin's capabilities server-side so Rust commands can enforce them.
+/// Called by the frontend when a plugin is loaded. Overwrites any previous entry.
+///
+/// Security: validates the claimed capabilities against the on-disk manifest.
+/// The frontend cannot self-register arbitrary capabilities.
+#[tauri::command]
+pub fn register_loaded_plugin(
+    plugin_id: String,
+    capabilities: Vec<String>,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
+) -> Result<(), String> {
+    // Ground truth is the on-disk manifest, not the frontend-supplied capabilities
+    let manifests = list_user_plugins();
+    let manifest = manifests
+        .iter()
+        .find(|m| m.id == plugin_id)
+        .ok_or_else(|| format!("Plugin \"{plugin_id}\" is not installed"))?;
+
+    // Only allow capabilities that appear in the manifest
+    for cap in &capabilities {
+        if !manifest.capabilities.contains(cap) {
+            return Err(format!(
+                "Plugin \"{plugin_id}\" claims capability \"{cap}\" not declared in manifest"
+            ));
+        }
+    }
+
+    state.loaded_plugins.insert(plugin_id, capabilities);
+    Ok(())
+}
+
+/// Unregister a plugin's capabilities when it is unloaded.
+#[tauri::command]
+pub fn unregister_loaded_plugin(
+    plugin_id: String,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
+) {
+    state.loaded_plugins.remove(&plugin_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,5 +1097,41 @@ mod tests {
         let result = find_manifest_in_zip(&archive);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
+    }
+
+    // -- Capability enforcement --
+
+    #[test]
+    fn check_capability_passes_with_valid_capability() {
+        let plugins = dashmap::DashMap::new();
+        plugins.insert(
+            "test-plugin".to_string(),
+            vec!["fs:read".to_string(), "net:http".to_string()],
+        );
+        assert!(check_plugin_capability_inner(&plugins, "test-plugin", "fs:read").is_ok());
+        assert!(check_plugin_capability_inner(&plugins, "test-plugin", "net:http").is_ok());
+    }
+
+    #[test]
+    fn check_capability_rejects_missing_capability() {
+        let plugins = dashmap::DashMap::new();
+        plugins.insert(
+            "test-plugin".to_string(),
+            vec!["fs:read".to_string()],
+        );
+        let result = check_plugin_capability_inner(&plugins, "test-plugin", "exec:cli");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("test-plugin"), "Error should mention plugin ID");
+        assert!(err.contains("exec:cli"), "Error should mention missing capability");
+    }
+
+    #[test]
+    fn check_capability_rejects_unknown_plugin() {
+        let plugins = dashmap::DashMap::new();
+        let result = check_plugin_capability_inner(&plugins, "nonexistent", "fs:read");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("nonexistent"), "Error should mention unknown plugin ID");
     }
 }

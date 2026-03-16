@@ -4,10 +4,17 @@
 //! circular buffer. The frontend pushes entries via `push_log` and retrieves
 //! them via `get_logs`. This is the Rust source-of-truth for the log store;
 //! the TypeScript `appLogger` store delegates to these commands.
+//!
+//! The `tracing` subscriber is wired to this buffer via [`RingBufferLayer`],
+//! so every `tracing::warn!()` / `tracing::error!()` / etc. automatically
+//! appears in the ErrorLogPanel and the `/logs` HTTP endpoint.
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{Manager, State};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::AppState;
 
@@ -25,6 +32,14 @@ pub(crate) struct LogEntry {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_json: Option<String>,
+    /// How many consecutive duplicate messages were coalesced into this entry.
+    /// 0 = first occurrence (no repeats), 1 = seen twice, etc.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub repeat_count: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +74,11 @@ impl LogRingBuffer {
     }
 
     /// Push a new entry into the ring buffer. Returns the assigned entry ID.
+    ///
+    /// If the most recent entry has the same level+source+message, the new push
+    /// is coalesced: the existing entry's timestamp and repeat_count are updated
+    /// instead of allocating a new slot. This prevents identical recurring
+    /// warnings (e.g. polling failures) from flooding the ring buffer.
     pub(crate) fn push(
         &mut self,
         level: String,
@@ -66,6 +86,24 @@ impl LogRingBuffer {
         message: String,
         data_json: Option<String>,
     ) -> u64 {
+        // Dedup: coalesce with the most recent entry if level+source+message match
+        if self.count > 0 {
+            let last_idx = if self.write_pos == 0 {
+                self.capacity - 1
+            } else {
+                self.write_pos - 1
+            };
+            if let Some(last) = &mut self.entries[last_idx]
+                && last.level == level
+                && last.source == source
+                && last.message == message
+            {
+                last.repeat_count += 1;
+                last.timestamp_ms = chrono::Utc::now().timestamp_millis();
+                return last.id;
+            }
+        }
+
         let id = self.next_id;
         self.next_id += 1;
 
@@ -78,6 +116,7 @@ impl LogRingBuffer {
             source,
             message,
             data_json,
+            repeat_count: 0,
         };
 
         self.entries[self.write_pos] = Some(entry);
@@ -133,6 +172,107 @@ impl LogRingBuffer {
     pub(crate) fn len(&self) -> usize {
         self.count
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tracing → ring buffer layer
+// ---------------------------------------------------------------------------
+
+/// A `tracing_subscriber::Layer` that forwards events into the [`LogRingBuffer`].
+///
+/// It extracts the first `source` field from the event's span/fields (falling
+/// back to the event target) and maps the tracing level to the ring buffer's
+/// `level` string (`"error"`, `"warn"`, `"info"`, `"debug"`).
+struct RingBufferLayer {
+    buffer: Arc<Mutex<LogRingBuffer>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingBufferLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        // Extract the message and optional `source` field.
+        let mut visitor = LogVisitor::default();
+        event.record(&mut visitor);
+
+        let level = match *event.metadata().level() {
+            tracing::Level::ERROR => "error",
+            tracing::Level::WARN => "warn",
+            tracing::Level::INFO => "info",
+            _ => "debug",
+        };
+
+        let source = visitor
+            .source
+            .unwrap_or_else(|| event.metadata().target().to_string());
+
+        let message = visitor.message.unwrap_or_default();
+        if message.is_empty() {
+            return;
+        }
+
+        let mut buf = self.buffer.lock();
+        buf.push(
+            level.to_string(),
+            source,
+            message,
+            None,
+        );
+    }
+}
+
+/// Visitor that extracts `message` and `source` fields from a tracing event.
+#[derive(Default)]
+struct LogVisitor {
+    message: Option<String>,
+    source: Option<String>,
+}
+
+impl tracing::field::Visit for LogVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            "message" => self.message = Some(value.to_string()),
+            "source" => self.source = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "message" => self.message = Some(format!("{value:?}")),
+            "source" => self.source = Some(format!("{value:?}")),
+            _ => {}
+        }
+    }
+}
+
+/// Initialise the global `tracing` subscriber.
+///
+/// Sets up two layers:
+/// 1. **fmt** — writes structured logs to stderr (visible in `tauri dev`).
+/// 2. **RingBufferLayer** — forwards events into the shared [`LogRingBuffer`]
+///    so they appear in the ErrorLogPanel and the `/logs` HTTP endpoint.
+///
+/// The default level is `info`; override with `RUST_LOG=debug` etc.
+/// Must be called exactly once, early in `run()`.
+pub(crate) fn init_tracing(buffer: Arc<Mutex<LogRingBuffer>>) {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_writer(std::io::stderr);
+
+    let ring_layer = RingBufferLayer { buffer };
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .with(ring_layer)
+        .init();
 }
 
 // ---------------------------------------------------------------------------
@@ -335,5 +475,92 @@ mod tests {
         assert_eq!(entry.message, "rate limited");
         assert!(entry.timestamp_ms > 0);
         assert!(entry.data_json.is_none());
+    }
+
+    // ---- Deduplication tests ----
+
+    #[test]
+    fn dedup_identical_consecutive_messages() {
+        let mut buf = LogRingBuffer::new(10);
+        buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+        buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+        buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+
+        // Should coalesce into a single entry with repeat_count=2
+        assert_eq!(buf.len(), 1);
+        let entries = buf.get_entries(0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "poll failed");
+        assert_eq!(entries[0].repeat_count, 2);
+    }
+
+    #[test]
+    fn dedup_resets_on_different_message() {
+        let mut buf = LogRingBuffer::new(10);
+        buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+        buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+        buf.push("info".into(), "app".into(), "something else".into(), None);
+        buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+
+        // 3 entries: first (repeat_count=1), different, second occurrence
+        assert_eq!(buf.len(), 3);
+        let entries = buf.get_entries(0);
+        assert_eq!(entries[0].repeat_count, 1);
+        assert_eq!(entries[1].repeat_count, 0);
+        assert_eq!(entries[2].repeat_count, 0);
+    }
+
+    #[test]
+    fn dedup_requires_matching_level_source_message() {
+        let mut buf = LogRingBuffer::new(10);
+        buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+        // Same message but different source — no dedup
+        buf.push("warn".into(), "git".into(), "poll failed".into(), None);
+        // Same source+message but different level — no dedup
+        buf.push("error".into(), "github".into(), "poll failed".into(), None);
+
+        assert_eq!(buf.len(), 3);
+    }
+
+    #[test]
+    fn dedup_updates_timestamp() {
+        let mut buf = LogRingBuffer::new(10);
+        buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+        let ts1 = buf.get_entries(0)[0].timestamp_ms;
+
+        // Small delay to ensure different timestamp
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+
+        let entries = buf.get_entries(0);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].timestamp_ms >= ts1);
+    }
+
+    #[test]
+    fn dedup_preserves_original_id() {
+        let mut buf = LogRingBuffer::new(10);
+        let id1 = buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+        let id2 = buf.push("warn".into(), "github".into(), "poll failed".into(), None);
+
+        // Both return same id since it's coalesced
+        assert_eq!(id1, id2);
+        let entries = buf.get_entries(0);
+        assert_eq!(entries[0].id, id1);
+    }
+
+    #[test]
+    fn dedup_works_at_buffer_boundary() {
+        let mut buf = LogRingBuffer::new(3);
+        buf.push("info".into(), "app".into(), "a".into(), None);
+        buf.push("info".into(), "app".into(), "b".into(), None);
+        buf.push("info".into(), "app".into(), "c".into(), None);
+        // Buffer full. Now push duplicate of last — should dedup, not wrap
+        buf.push("info".into(), "app".into(), "c".into(), None);
+
+        assert_eq!(buf.len(), 3);
+        let entries = buf.get_entries(0);
+        assert_eq!(entries[2].message, "c");
+        assert_eq!(entries[2].repeat_count, 1);
     }
 }

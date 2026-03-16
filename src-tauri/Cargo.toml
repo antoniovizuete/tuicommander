@@ -1,11 +1,16 @@
+[workspace]
+members = [".", "crates/tuic-bridge"]
+
 [package]
 name = "tuicommander"
-version = "0.8.2"
+version = "0.9.0"
 description = "TUICommander - Native platform for AI coding agents"
 authors = ["Stefano Straus <github.com/sstraus>"]
 edition = "2024"
 default-run = "tuicommander"
 
+[profile.release]
+incremental = true
 [lib]
 name = "tuicommander_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -14,7 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -31,7 +36,7 @@ tauri-plugin-single-instance = "2"
 whisper-rs = "0.15"
 cpal = "0.17"
 rodio = "0.20"
-reqwest = { version = "0.13", features = ["stream", "json", "blocking"] }
+reqwest = { version = "0.13", features = ["stream", "json"] }
 futures-util = "0.3"
 tauri-plugin-global-shortcut = "2"
 axum = { version = "0.8", features = ["ws"] }
@@ -53,6 +58,7 @@ tauri-plugin-process = "2"
 tauri-plugin-deep-link = "2"
 zip = "8"
 glob = "0.3"
+ignore = "0.4"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 url = "2"
 chrono = { version = "0.4", features = ["serde"] }
@@ -62,6 +68,8 @@ aes-gcm = "0.10"
 sha2 = "0.10"
 hkdf = "0.12"
 anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.15", features = ["metal"] }
@@ -77,8 +85,4 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 serial_test = "3"
 mockito = "1"
-
-[[bin]]
-name = "tuic-bridge"
-path = "src/bin/tuic_bridge.rs"
 

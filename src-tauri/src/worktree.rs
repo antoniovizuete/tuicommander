@@ -6,6 +6,29 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::State;
 
+/// Resolve the effective archive_script for a repo from the three-tier config:
+/// per-repo settings → repo-local .tuic.json → global defaults.
+/// Returns None if no script is configured at any level.
+fn resolve_archive_script(repo_path: &str) -> Option<String> {
+    // 1. Per-repo app settings (highest priority)
+    let repo_settings = crate::config::load_repo_settings();
+    if let Some(entry) = repo_settings.repos.get(repo_path)
+        && let Some(ref script) = entry.archive_script
+        && !script.is_empty()
+    {
+        return Some(script.clone());
+    }
+    // .tuic.json scripts intentionally skipped — executing repo-committed
+    // scripts without TOFU prompt is unsafe. Re-add when trust-on-first-use
+    // confirmation is implemented.
+    // 2. Global repo defaults (lowest priority)
+    let defaults = crate::config::load_repo_defaults();
+    if !defaults.archive_script.is_empty() {
+        return Some(defaults.archive_script);
+    }
+    None
+}
+
 /// Parse `git worktree list --porcelain` output and return the worktree path
 /// for the given branch name, if any.
 fn find_worktree_path_for_branch(stdout: &str, branch_name: &str) -> Option<PathBuf> {
@@ -198,7 +221,7 @@ pub(crate) fn remove_worktree_internal(worktree: &WorktreeInfo) -> Result<(), St
 
     // Prune worktrees (non-fatal: stale entries are harmless)
     if let Err(e) = git_cmd(&worktree.base_repo).args(["worktree", "prune"]).run() {
-        eprintln!("Warning: git worktree prune failed: {e}");
+        tracing::warn!(source = "worktree", "git worktree prune failed: {e}");
     }
 
     Ok(())
@@ -311,7 +334,7 @@ pub(crate) fn get_worktrees_dir(state: State<'_, Arc<AppState>>, repo_path: Opti
 ///
 /// When `delete_branch` is true, also deletes the local branch after removing
 /// the worktree directory. When false, the branch is preserved.
-pub(crate) fn remove_worktree_by_branch(repo_path: &str, branch_name: &str, delete_branch: bool) -> Result<(), String> {
+pub(crate) fn remove_worktree_by_branch(repo_path: &str, branch_name: &str, delete_branch: bool, archive_script: Option<&str>) -> Result<(), String> {
     let base_repo = PathBuf::from(repo_path);
 
     // List worktrees to find the path for this branch
@@ -322,6 +345,14 @@ pub(crate) fn remove_worktree_by_branch(repo_path: &str, branch_name: &str, dele
 
     let worktree_path = find_worktree_path_for_branch(&out.stdout, branch_name)
         .ok_or_else(|| format!("No worktree found for branch '{branch_name}'"))?;
+
+    // Run archive/cleanup script before deletion (if configured)
+    if let Some(script) = archive_script
+        && !script.is_empty()
+    {
+        run_script_in_dir(script, &worktree_path)
+            .map_err(|e| format!("Archive script failed: {e}"))?;
+    }
 
     // Remove the worktree
     let worktree = WorktreeInfo {
@@ -339,7 +370,7 @@ pub(crate) fn remove_worktree_by_branch(repo_path: &str, branch_name: &str, dele
             .args(["branch", "-d", branch_name])
             .run()
         {
-            eprintln!("Warning: git branch -d {branch_name}: {e}");
+            tracing::warn!(source = "worktree", branch = %branch_name, "git branch -d failed: {e}");
         }
 
     Ok(())
@@ -350,7 +381,8 @@ pub(crate) fn remove_worktree_by_branch(repo_path: &str, branch_name: &str, dele
 /// `delete_branch` defaults to `true` when omitted (preserving existing behavior).
 #[tauri::command]
 pub(crate) fn remove_worktree(state: State<'_, Arc<AppState>>, repo_path: String, branch_name: String, delete_branch: Option<bool>) -> Result<(), String> {
-    remove_worktree_by_branch(&repo_path, &branch_name, delete_branch.unwrap_or(true))?;
+    let script = resolve_archive_script(&repo_path);
+    remove_worktree_by_branch(&repo_path, &branch_name, delete_branch.unwrap_or(true), script.as_deref())?;
     state.invalidate_repo_caches(&repo_path);
     Ok(())
 }
@@ -403,7 +435,7 @@ pub(crate) fn delete_local_branch_impl(repo_path: &str, branch_name: &str) -> Re
 
     if has_worktree {
         // Remove worktree + branch in one go
-        remove_worktree_by_branch(repo_path, branch_name, true)?;
+        remove_worktree_by_branch(repo_path, branch_name, true, None)?;
     } else {
         // Just delete the branch ref
         git_cmd(&base_repo)
@@ -772,10 +804,11 @@ pub(crate) fn finalize_merged_worktree(
     branch_name: String,
     action: String,
 ) -> Result<MergeArchiveResult, String> {
+    let script = resolve_archive_script(&repo_path);
     let base_repo = std::path::PathBuf::from(&repo_path);
     match action.as_str() {
         "archive" => {
-            let archive_path = archive_worktree(&base_repo, &branch_name)?;
+            let archive_path = archive_worktree(&base_repo, &branch_name, script.as_deref())?;
             state.invalidate_repo_caches(&repo_path);
             Ok(MergeArchiveResult {
                 merged: true,
@@ -784,7 +817,7 @@ pub(crate) fn finalize_merged_worktree(
             })
         }
         "delete" => {
-            remove_worktree_by_branch(&repo_path, &branch_name, true)?;
+            remove_worktree_by_branch(&repo_path, &branch_name, true, script.as_deref())?;
             state.invalidate_repo_caches(&repo_path);
             Ok(MergeArchiveResult {
                 merged: true,
@@ -810,6 +843,7 @@ pub(crate) fn merge_and_archive_worktree(
     target_branch: String,
     after_merge: String,
 ) -> Result<MergeArchiveResult, String> {
+    let script = resolve_archive_script(&repo_path);
     let base_repo = PathBuf::from(&repo_path);
 
     // 1. Ensure we're on the target branch in the base repo
@@ -831,7 +865,7 @@ pub(crate) fn merge_and_archive_worktree(
     // 3. Handle the worktree based on after_merge setting
     match after_merge.as_str() {
         "archive" => {
-            let archive_path = archive_worktree(&base_repo, &branch_name)?;
+            let archive_path = archive_worktree(&base_repo, &branch_name, script.as_deref())?;
             state.invalidate_repo_caches(&repo_path);
             Ok(MergeArchiveResult {
                 merged: true,
@@ -840,7 +874,7 @@ pub(crate) fn merge_and_archive_worktree(
             })
         }
         "delete" => {
-            remove_worktree_by_branch(&repo_path, &branch_name, true)?;
+            remove_worktree_by_branch(&repo_path, &branch_name, true, script.as_deref())?;
             state.invalidate_repo_caches(&repo_path);
             Ok(MergeArchiveResult {
                 merged: true,
@@ -862,7 +896,10 @@ pub(crate) fn merge_and_archive_worktree(
 
 /// Archive a worktree: move its directory to `{worktrees_dir}/__archived/{branch_name}/`
 /// and run `git worktree remove`.
-pub(crate) fn archive_worktree(base_repo: &Path, branch_name: &str) -> Result<String, String> {
+///
+/// If `archive_script` is provided (non-empty), it runs in the worktree directory
+/// before archiving. A non-zero exit code aborts the operation.
+pub(crate) fn archive_worktree(base_repo: &Path, branch_name: &str, archive_script: Option<&str>) -> Result<String, String> {
     // Find worktree path for this branch
     let wt_list_out = git_cmd(base_repo)
         .args(["worktree", "list", "--porcelain"])
@@ -871,6 +908,14 @@ pub(crate) fn archive_worktree(base_repo: &Path, branch_name: &str) -> Result<St
 
     let wt_path = find_worktree_path_for_branch(&wt_list_out.stdout, branch_name)
         .ok_or_else(|| format!("No worktree found for branch '{branch_name}'"))?;
+
+    // Run archive script before archiving (if configured)
+    if let Some(script) = archive_script
+        && !script.is_empty()
+    {
+        run_script_in_dir(script, &wt_path)
+            .map_err(|e| format!("Archive script failed: {e}"))?;
+    }
     let parent_dir = wt_path.parent().ok_or("Worktree has no parent directory")?;
     let archive_dir = parent_dir.join("__archived");
     let sanitized = sanitize_name(branch_name);
@@ -886,7 +931,7 @@ pub(crate) fn archive_worktree(base_repo: &Path, branch_name: &str) -> Result<St
         .args(["worktree", "remove", "--force", &wt_path_str])
         .run()
     {
-        eprintln!("[worktree] archive: failed to remove worktree link: {e}");
+        tracing::warn!(source = "worktree", "Archive: failed to remove worktree link: {e}");
     }
 
     // Move the directory if it still exists (worktree remove may have deleted it)
@@ -903,6 +948,31 @@ pub(crate) fn archive_worktree(base_repo: &Path, branch_name: &str) -> Result<St
     let _ = git_cmd(base_repo).args(["worktree", "prune"]).run();
 
     Ok(archive_dest.to_string_lossy().to_string())
+}
+
+/// Run a shell script in a directory and return an error if it exits non-zero.
+///
+/// Used by archive/delete operations to run cleanup scripts before the operation.
+fn run_script_in_dir(script: &str, cwd: &Path) -> Result<(), String> {
+    let (shell, flag) = if cfg!(target_os = "windows") {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+
+    let output = std::process::Command::new(shell)
+        .arg(flag)
+        .arg(script)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("Failed to execute script: {e}"))?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    if exit_code != 0 {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Script failed with exit code {exit_code}: {stderr}"));
+    }
+    Ok(())
 }
 
 /// Run a shell script in a given directory and return exit code + output.
@@ -1205,7 +1275,7 @@ mod tests {
         git_cmd(&wt.path).args(["commit", "-m", "feat: add feature"]).run().expect("git commit");
 
         // Archive the worktree
-        let result = archive_worktree(repo.path(), "feat-archive-test");
+        let result = archive_worktree(repo.path(), "feat-archive-test", None);
         assert!(result.is_ok(), "Archive should succeed: {:?}", result);
 
         let _archive_path = PathBuf::from(result.unwrap());
@@ -1233,7 +1303,7 @@ mod tests {
             .expect("Failed to create worktree");
 
         // Remove with delete_branch=true
-        remove_worktree_by_branch(&repo_path, "feat-delete-branch", true)
+        remove_worktree_by_branch(&repo_path, "feat-delete-branch", true, None)
             .expect("Failed to remove worktree");
 
         // Branch should be gone
@@ -1265,7 +1335,7 @@ mod tests {
             .expect("Failed to create worktree");
 
         // Remove with delete_branch=false
-        remove_worktree_by_branch(&repo_path, "feat-keep-branch", false)
+        remove_worktree_by_branch(&repo_path, "feat-keep-branch", false, None)
             .expect("Failed to remove worktree");
 
         // Branch should still exist
@@ -1526,5 +1596,82 @@ branch refs/heads/feat
         let result = run_setup_script("cat marker.txt".to_string(), cwd).expect("should succeed");
         assert_eq!(result["exit_code"], 0);
         assert_eq!(result["stdout"].as_str().unwrap().trim(), "found");
+    }
+
+    #[test]
+    fn run_script_in_dir_succeeds_with_zero_exit() {
+        let dir = TempDir::new().expect("temp dir");
+        let result = run_script_in_dir("echo hello", dir.path());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn run_script_in_dir_fails_with_nonzero_exit() {
+        let dir = TempDir::new().expect("temp dir");
+        let result = run_script_in_dir("exit 1", dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("exit code 1"));
+    }
+
+    #[test]
+    fn run_script_in_dir_runs_in_correct_directory() {
+        let dir = TempDir::new().expect("temp dir");
+        fs::write(dir.path().join("test-file.txt"), "content").expect("write");
+        let result = run_script_in_dir("cat test-file.txt", dir.path());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn archive_worktree_runs_archive_script_before_archiving() {
+        let repo = setup_test_repo();
+        let worktrees_dir = repo.path().join("worktrees");
+        let config = WorktreeConfig {
+            task_name: "archive-script-test".to_string(),
+            base_repo: repo.path().to_string_lossy().to_string(),
+            branch: None,
+            create_branch: false,
+        };
+        let _wt = create_worktree_internal(&worktrees_dir, &config, None)
+            .expect("create worktree");
+        // Script creates a marker file; archive should still succeed
+        let result = archive_worktree(repo.path(), "archive-script-test", Some("touch /tmp/tuic-archive-test-marker"));
+        assert!(result.is_ok(), "archive with script should succeed: {:?}", result);
+    }
+
+    #[test]
+    fn archive_worktree_blocks_on_failed_script() {
+        let repo = setup_test_repo();
+        let worktrees_dir = repo.path().join("worktrees");
+        let config = WorktreeConfig {
+            task_name: "archive-block-test".to_string(),
+            base_repo: repo.path().to_string_lossy().to_string(),
+            branch: None,
+            create_branch: false,
+        };
+        let wt = create_worktree_internal(&worktrees_dir, &config, None)
+            .expect("create worktree");
+        // Script exits non-zero — archive should be blocked
+        let result = archive_worktree(repo.path(), "archive-block-test", Some("exit 1"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Archive script failed"));
+        // Worktree should still exist (not archived)
+        assert!(wt.path.exists(), "worktree should still exist after failed script");
+    }
+
+    #[test]
+    fn archive_worktree_skips_empty_script() {
+        let repo = setup_test_repo();
+        let worktrees_dir = repo.path().join("worktrees");
+        let config = WorktreeConfig {
+            task_name: "archive-noscript-test".to_string(),
+            base_repo: repo.path().to_string_lossy().to_string(),
+            branch: None,
+            create_branch: false,
+        };
+        create_worktree_internal(&worktrees_dir, &config, None)
+            .expect("create worktree");
+        // None script — should proceed normally
+        let result = archive_worktree(repo.path(), "archive-noscript-test", None);
+        assert!(result.is_ok(), "archive without script should succeed: {:?}", result);
     }
 }

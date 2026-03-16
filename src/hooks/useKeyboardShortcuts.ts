@@ -42,7 +42,6 @@ export interface ShortcutHandlers {
   lazygitAvailable: () => boolean;
   spawnLazygit: () => void;
   openLazygitPane: () => void;
-  toggleDiffPanel: () => void;
   toggleMarkdownPanel: () => void;
   toggleSidebar: () => void;
   togglePromptLibrary: () => void;
@@ -61,6 +60,9 @@ export interface ShortcutHandlers {
   toggleErrorLog: () => void;
 }
 
+/** Keys that are modifiers only — not real shortcut targets */
+const modifierKeys = new Set(["control", "meta", "alt", "shift"]);
+
 /**
  * Convert a KeyboardEvent into a normalized combo string that matches our keybinding format.
  * "Cmd" maps to the platform primary modifier: metaKey on macOS, ctrlKey on Windows/Linux.
@@ -77,7 +79,6 @@ export function eventToCombo(e: KeyboardEvent): string {
   // For modifier-only keydowns (e.g. pressing Shift alone), key would be "Shift"
   // — skip those since they're not real shortcuts
   const key = e.key.toLowerCase();
-  const modifierKeys = new Set(["control", "meta", "alt", "shift"]);
   if (modifierKeys.has(key)) return "";
 
   parts.sort();
@@ -118,7 +119,6 @@ function dispatchAction(action: ActionName, handlers: ShortcutHandlers): boolean
     case "edit-command": handlers.handleRunCommand(true); return true;
 
     // Panel toggles
-    case "toggle-diff": handlers.toggleDiffPanel(); return true;
     case "toggle-markdown": handlers.toggleMarkdownPanel(); return true;
     case "toggle-notes": handlers.toggleNotesPanel(); return true;
     case "toggle-file-browser": handlers.toggleFileBrowserPanel(); return true;

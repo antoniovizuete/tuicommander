@@ -158,15 +158,23 @@ pub(crate) fn get_ignored_paths(repo_path: &str, paths: &[String]) -> std::colle
 
 /// List entries in a directory within a repository.
 #[tauri::command]
-pub fn list_directory(repo_path: String, subdir: String) -> Result<Vec<DirEntry>, String> {
+pub async fn list_directory(repo_path: String, subdir: String) -> Result<Vec<DirEntry>, String> {
+    list_directory_impl(repo_path, subdir)
+}
+
+pub(crate) fn list_directory_impl(repo_path: String, subdir: String) -> Result<Vec<DirEntry>, String> {
     let repo = PathBuf::from(&repo_path);
+
+    // Canonicalize repo root ONCE — all relative paths derived via join + strip_prefix
+    let canonical_repo = repo
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve repo path: {e}"))?;
 
     // Validate the subdir is within the repo
     let dir_to_read = if subdir.is_empty() || subdir == "." {
-        repo.canonicalize()
-            .map_err(|e| format!("Failed to resolve repo path: {e}"))?
+        canonical_repo.clone()
     } else {
-        let (_canonical_repo, canonical_dir) = validate_path(&repo_path, &subdir)?;
+        let (_cr, canonical_dir) = validate_path(&repo_path, &subdir)?;
         canonical_dir
     };
 
@@ -177,9 +185,15 @@ pub fn list_directory(repo_path: String, subdir: String) -> Result<Vec<DirEntry>
     // Get git statuses for this subdir
     let git_statuses = parse_git_status(&repo_path, &subdir);
 
-    let canonical_repo = repo
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve repo path: {e}"))?;
+    // Build gitignore matcher from the repo's .gitignore (no subprocess)
+    let gitignore_path = canonical_repo.join(".gitignore");
+    let gitignore = if gitignore_path.exists() {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&canonical_repo);
+        builder.add(&gitignore_path);
+        builder.build().ok()
+    } else {
+        None
+    };
 
     let mut entries = Vec::new();
     let read_dir = std::fs::read_dir(&dir_to_read)
@@ -206,16 +220,18 @@ pub fn list_directory(repo_path: String, subdir: String) -> Result<Vec<DirEntry>
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_secs());
 
-        // Compute relative path from repo root
-        let canonical_entry = entry
-            .path()
-            .canonicalize()
-            .map_err(|e| format!("Failed to canonicalize {name}: {e}"))?;
-        let relative = canonical_entry
+        // Compute relative path via join + strip_prefix (no canonicalize per entry)
+        let abs_path = dir_to_read.join(&name);
+        let relative = abs_path
             .strip_prefix(&canonical_repo)
             .map_err(|_| format!("Entry {name} is outside repo"))?
             .to_string_lossy()
             .replace('\\', "/");
+
+        // Check gitignore status without subprocess
+        let is_ignored = gitignore.as_ref().is_some_and(|gi| {
+            gi.matched_path_or_any_parents(&abs_path, is_dir).is_ignore()
+        });
 
         // Look up git status — for dirs, propagate the most relevant child status
         let git_status = if is_dir {
@@ -233,7 +249,6 @@ pub fn list_directory(repo_path: String, subdir: String) -> Result<Vec<DirEntry>
                     }
                 }
             }
-            // Priority: staged > modified > untracked
             if has_staged {
                 "staged".to_string()
             } else if has_modified {
@@ -254,15 +269,8 @@ pub fn list_directory(repo_path: String, subdir: String) -> Result<Vec<DirEntry>
             size,
             modified_at,
             git_status,
-            is_ignored: false, // populated after collecting all entries
+            is_ignored,
         });
-    }
-
-    // Detect gitignored paths
-    let all_relative_paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
-    let ignored_set = get_ignored_paths(&repo_path, &all_relative_paths);
-    for entry in &mut entries {
-        entry.is_ignored = ignored_set.contains(&entry.path);
     }
 
     // Sort: directories first, then alphabetical (case-insensitive)
@@ -277,9 +285,17 @@ pub fn list_directory(repo_path: String, subdir: String) -> Result<Vec<DirEntry>
 
 /// Recursively search files in a repository matching a glob-like query.
 /// Returns up to `limit` results (default 200) to avoid blowing up on huge repos.
-/// Respects .gitignore by checking `git check-ignore`.
+/// Respects .gitignore natively via the `ignore` crate (no subprocess).
 #[tauri::command]
-pub fn search_files(
+pub async fn search_files(
+    repo_path: String,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<DirEntry>, String> {
+    search_files_impl(repo_path, query, limit)
+}
+
+pub(crate) fn search_files_impl(
     repo_path: String,
     query: String,
     limit: Option<usize>,
@@ -292,17 +308,73 @@ pub fn search_files(
     let max_results = limit.unwrap_or(200);
     let pattern = build_search_pattern(&query);
 
-    // Get all git statuses for the whole repo
-    let git_statuses = parse_git_status(&repo_path, ".");
-
     let mut results = Vec::new();
-    walk_directory(&canonical_repo, &canonical_repo, &pattern, &git_statuses, &mut results, max_results);
 
-    // Detect gitignored paths
-    let all_relative_paths: Vec<String> = results.iter().map(|e| e.path.clone()).collect();
-    let ignored_set = get_ignored_paths(&repo_path, &all_relative_paths);
-    for entry in &mut results {
-        entry.is_ignored = ignored_set.contains(&entry.path);
+    // Walk using the `ignore` crate: respects .gitignore, .git/info/exclude,
+    // global gitignore — skips ignored directories entirely during traversal.
+    let walker = ignore::WalkBuilder::new(&canonical_repo)
+        .hidden(false) // show dotfiles (except .git which is always skipped)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    for entry in walker {
+        if results.len() >= max_results {
+            break;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
+        if !is_file {
+            continue;
+        }
+
+        let relative = match entry.path().strip_prefix(&canonical_repo) {
+            Ok(p) => p.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Match against file name or relative path
+        if !pattern.is_match(&name) && !pattern.is_match(&relative) {
+            continue;
+        }
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+
+        results.push(DirEntry {
+            name,
+            path: relative,
+            is_dir: false,
+            size: metadata.len(),
+            modified_at,
+            git_status: String::new(), // populated below
+            is_ignored: false, // walker already filtered gitignored entries
+        });
+    }
+
+    // Get git statuses only for matched results (not the whole repo)
+    if !results.is_empty() {
+        let git_statuses = parse_git_status(&repo_path, ".");
+        for entry in &mut results {
+            if let Some(status) = git_statuses.get(&entry.path) {
+                entry.git_status = status.clone();
+            }
+        }
     }
 
     // Sort by path for predictable results
@@ -337,83 +409,7 @@ fn build_search_pattern(query: &str) -> regex::Regex {
     })
 }
 
-/// Recursively walk a directory, collecting entries that match the pattern.
-fn walk_directory(
-    root: &PathBuf,
-    dir: &PathBuf,
-    pattern: &regex::Regex,
-    git_statuses: &std::collections::HashMap<String, String>,
-    results: &mut Vec<DirEntry>,
-    max_results: usize,
-) {
-    if results.len() >= max_results {
-        return;
-    }
 
-    let read_dir = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return,
-    };
-
-    for entry in read_dir {
-        if results.len() >= max_results {
-            return;
-        }
-
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        // Skip hidden/special directories
-        if name == ".git" || name == "node_modules" || name == ".DS_Store" {
-            continue;
-        }
-
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        let canonical_entry = match entry.path().canonicalize() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let relative = match canonical_entry.strip_prefix(root) {
-            Ok(p) => p.to_string_lossy().replace('\\', "/"),
-            Err(_) => continue,
-        };
-
-        let is_dir = metadata.is_dir();
-
-        if is_dir {
-            // Recurse into subdirectories
-            walk_directory(root, &canonical_entry, pattern, git_statuses, results, max_results);
-        } else {
-            // Check if file name or path matches the search pattern
-            if pattern.is_match(&name) || pattern.is_match(&relative) {
-                let git_status = git_statuses.get(&relative).cloned().unwrap_or_default();
-                let modified_at = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs());
-                results.push(DirEntry {
-                    name,
-                    path: relative,
-                    is_dir: false,
-                    size: metadata.len(),
-                    modified_at,
-                    git_status,
-                    is_ignored: false,
-                });
-            }
-        }
-    }
-}
 
 /// Read a file's content within a repository.
 /// Re-uses the existing `read_file_impl` from lib.rs.
@@ -688,7 +684,7 @@ mod tests {
         let dir = setup_test_repo();
         let repo_path = dir.path().to_string_lossy().to_string();
 
-        let entries = list_directory(repo_path, ".".to_string()).unwrap();
+        let entries = list_directory_impl(repo_path, ".".to_string()).unwrap();
 
         // Should have: src/ dir, README.md, main.rs (no .git)
         assert!(entries.len() >= 3);
@@ -712,7 +708,7 @@ mod tests {
         let dir = setup_test_repo();
         let repo_path = dir.path().to_string_lossy().to_string();
 
-        let entries = list_directory(repo_path, "src".to_string()).unwrap();
+        let entries = list_directory_impl(repo_path, "src".to_string()).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "lib.rs");
         assert!(!entries[0].is_dir);
@@ -724,7 +720,7 @@ mod tests {
         let dir = setup_test_repo();
         let repo_path = dir.path().to_string_lossy().to_string();
 
-        let result = list_directory(repo_path, "../".to_string());
+        let result = list_directory_impl(repo_path, "../".to_string());
         assert!(result.is_err());
     }
 
@@ -739,7 +735,7 @@ mod tests {
         // Add an untracked file
         fs::write(dir.path().join("new_file.txt"), "new").unwrap();
 
-        let entries = list_directory(repo_path, ".".to_string()).unwrap();
+        let entries = list_directory_impl(repo_path, ".".to_string()).unwrap();
 
         let readme = entries.iter().find(|e| e.name == "README.md").unwrap();
         assert_eq!(readme.git_status, "modified");
@@ -834,12 +830,12 @@ mod tests {
         let dir = setup_test_repo();
         let repo_path = dir.path().to_string_lossy().to_string();
 
-        let entries = list_directory(repo_path.clone(), "src".to_string()).unwrap();
+        let entries = list_directory_impl(repo_path.clone(), "src".to_string()).unwrap();
         for entry in &entries {
             assert!(!entry.path.contains('\\'), "Path should use / not \\: {}", entry.path);
         }
 
-        let root_entries = list_directory(repo_path, ".".to_string()).unwrap();
+        let root_entries = list_directory_impl(repo_path, ".".to_string()).unwrap();
         for entry in &root_entries {
             assert!(!entry.path.contains('\\'), "Path should use / not \\: {}", entry.path);
         }
@@ -850,11 +846,94 @@ mod tests {
         let dir = setup_test_repo();
         let repo_path = dir.path().to_string_lossy().to_string();
 
-        let entries = list_directory(repo_path, ".".to_string()).unwrap();
+        let entries = list_directory_impl(repo_path, ".".to_string()).unwrap();
 
         for entry in &entries {
             assert!(entry.modified_at > 0, "modified_at should be non-zero for {}", entry.name);
         }
+    }
+
+    #[test]
+    fn test_list_directory_marks_ignored() {
+        let dir = setup_test_repo();
+        let repo_path = dir.path().to_string_lossy().to_string();
+
+        // Create a file and a gitignore that ignores it
+        fs::write(dir.path().join("build.log"), "build output").unwrap();
+        fs::write(dir.path().join(".gitignore"), "build.log\n").unwrap();
+
+        let entries = list_directory_impl(repo_path, ".".to_string()).unwrap();
+
+        let build_log = entries.iter().find(|e| e.name == "build.log");
+        assert!(build_log.is_some(), "build.log should still appear in listing");
+        assert!(
+            build_log.unwrap().is_ignored,
+            "build.log should be marked as ignored"
+        );
+
+        // .gitignore itself should NOT be ignored
+        let gitignore = entries.iter().find(|e| e.name == ".gitignore");
+        assert!(gitignore.is_some(), ".gitignore should appear in listing");
+        assert!(
+            !gitignore.unwrap().is_ignored,
+            ".gitignore should NOT be marked as ignored"
+        );
+    }
+
+    // --- search_files tests ---
+
+    #[test]
+    fn test_search_files_basic() {
+        let dir = setup_test_repo();
+        let repo_path = dir.path().to_string_lossy().to_string();
+
+        let results = search_files_impl(repo_path, "lib".to_string(), None).unwrap();
+        assert!(
+            results.iter().any(|e| e.name == "lib.rs"),
+            "Should find lib.rs matching 'lib', got: {:?}",
+            results.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        // All results should have forward-slash paths
+        for entry in &results {
+            assert!(!entry.path.contains('\\'), "Path should use / not \\: {}", entry.path);
+        }
+    }
+
+    #[test]
+    fn test_search_files_respects_gitignore() {
+        let dir = setup_test_repo();
+        let repo_path = dir.path().to_string_lossy().to_string();
+
+        // Create an ignored directory with files
+        fs::create_dir(dir.path().join("build_output")).unwrap();
+        fs::write(dir.path().join("build_output/artifact.rs"), "// build").unwrap();
+        fs::write(dir.path().join(".gitignore"), "build_output/\n").unwrap();
+
+        let results = search_files_impl(repo_path, "artifact".to_string(), None).unwrap();
+        assert!(
+            results.iter().all(|e| !e.path.contains("build_output")),
+            "Should NOT find files inside gitignored directory, got: {:?}",
+            results.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_search_files_limit() {
+        let dir = setup_test_repo();
+        let repo_path = dir.path().to_string_lossy().to_string();
+
+        // Create many files
+        fs::create_dir(dir.path().join("many")).unwrap();
+        for i in 0..20 {
+            fs::write(dir.path().join(format!("many/file_{i}.txt")), "content").unwrap();
+        }
+
+        let results = search_files_impl(repo_path, "file_".to_string(), Some(5)).unwrap();
+        assert!(
+            results.len() <= 5,
+            "Should respect limit of 5, got {}",
+            results.len()
+        );
     }
 
     // --- strip_line_col_suffix tests ---

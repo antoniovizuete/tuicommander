@@ -42,7 +42,22 @@ All commands are invoked from the frontend via `invoke(command, args)`. In brows
 | `get_repo_structure` | `repo_path` | `RepoStructure` | Fast phase: worktree paths + merged branches only (Phase 1 of progressive loading) |
 | `get_repo_diff_stats` | `repo_path` | `RepoDiffStats` | Slow phase: per-worktree diff stats + last commit timestamps (Phase 2 of progressive loading) |
 | `run_git_command` | `path, args` | `GitCommandResult` | Run arbitrary git command (success, stdout, stderr, exit_code) |
-| `get_git_panel_context` | `path` | `GitPanelContext` | Rich context for Git Operations Panel (branch, ahead/behind, staged/changed/stash counts, last commit, rebase/cherry-pick state). Cached 5s TTL. |
+| `get_git_panel_context` | `path` | `GitPanelContext` | Rich context for Git Panel (branch, ahead/behind, staged/changed/stash counts, last commit, rebase/cherry-pick state). Cached 5s TTL. |
+| `get_working_tree_status` | `path` | `WorkingTreeStatus` | Full porcelain v2 status: branch, upstream, ahead/behind, stash count, staged/unstaged entries, untracked files |
+| `git_stage_files` | `path, files` | `()` | Stage files (`git add`). Path-traversal validated |
+| `git_unstage_files` | `path, files` | `()` | Unstage files (`git restore --staged`). Path-traversal validated |
+| `git_discard_files` | `path, files` | `()` | Discard working tree changes (`git restore`). Destructive. Path-traversal validated |
+| `git_commit` | `path, message, amend?` | `String` (commit hash) | Commit staged changes; optional `--amend`. Returns new HEAD hash |
+| `get_commit_log` | `path, count?, after?` | `Vec<CommitLogEntry>` | Paginated commit log (default 50, max 500). `after` is a commit hash for cursor-based pagination |
+| `get_stash_list` | `path` | `Vec<StashEntry>` | List stash entries (index, ref_name, message, hash) |
+| `get_file_history` | `path, file, count?, after?` | `Vec<CommitLogEntry>` | Per-file commit log following renames (default 50, max 500) |
+| `get_file_blame` | `path, file` | `Vec<BlameLine>` | Per-line blame: hash, author, author_time (unix), line_number, content |
+
+## Commit Graph (`git_graph.rs`)
+
+| Command | Args | Returns | Description |
+|---------|------|---------|-------------|
+| `get_commit_graph` | `path, count?` | `Vec<GraphNode>` | Lane-assigned commit graph for visual rendering. Default 200, max 1000. Returns hash, column, row, color_index (0–7), parents, refs, and connection metadata (from/to col/row) for Bezier curve drawing |
 
 ## GitHub Integration (`github.rs`)
 
@@ -62,7 +77,7 @@ All commands are invoked from the frontend via `invoke(command, args)`. In brows
 | Command | Args | Returns | Description |
 |---------|------|---------|-------------|
 | `create_worktree` | `base_repo, branch_name` | `JSON` | Create git worktree |
-| `remove_worktree` | `repo_path, branch_name, delete_branch?` | `()` | Remove worktree; `delete_branch` (default true) controls whether the local branch is also deleted |
+| `remove_worktree` | `repo_path, branch_name, delete_branch?` | `()` | Remove worktree; `delete_branch` (default true) controls whether the local branch is also deleted. Archive script resolved from config (not IPC). |
 | `delete_local_branch` | `repo_path, branch_name` | `()` | Delete a local branch (and its worktree if linked). Refuses to delete the default branch. Uses safe `git branch -d` |
 | `check_worktree_dirty` | `repo_path, branch_name` | `bool` | Check if a branch's worktree has uncommitted changes. Returns false if no worktree exists |
 | `get_worktree_paths` | `repo_path` | `HashMap<String,String>` | Worktree paths for repo |
@@ -100,12 +115,16 @@ All commands are invoked from the frontend via `invoke(command, args)`. In brows
 | `save_prompt_library` | `config` | `()` | Save prompts |
 | `load_notes` | -- | `JSON` | Load notes |
 | `save_notes` | `config` | `()` | Save notes |
+| `save_note_image` | `note_id, data_base64, extension` | `String` (absolute path) | Decode base64 image, validate ≤10 MB, write to `config_dir()/note-images/<note_id>/<timestamp>.<ext>` |
+| `delete_note_assets` | `note_id` | `()` | Remove `note-images/<note_id>/` directory recursively (no-op if missing) |
+| `get_note_images_dir` | -- | `String` | Return `config_dir()/note-images/` absolute path |
 | `load_keybindings` | -- | `JSON` | Load keybinding overrides |
 | `save_keybindings` | `config` | `()` | Save keybinding overrides |
 | `load_agents_config` | -- | `AgentsConfig` | Load per-agent run configs |
 | `save_agents_config` | `config` | `()` | Save per-agent run configs |
 | `load_activity` | -- | `ActivityConfig` | Load activity dashboard state |
 | `save_activity` | `config` | `()` | Save activity dashboard state |
+| `load_repo_local_config` | `repo_path` | `RepoLocalConfig?` | Read `.tuic.json` from repo root; returns null if absent or malformed |
 
 ## Agent Detection (`agent.rs`)
 
@@ -305,12 +324,13 @@ Uses incremental parsing with a file-size-based cache (`claude-usage-cache.json`
 | `hash_password` | `password` | `String` | Bcrypt hash |
 | `list_markdown_files` | `path` | `Vec<MarkdownFileEntry>` | List .md files in dir |
 | `read_file` | `path, file` | `String` | Read file contents |
-| `get_mcp_status` | -- | `JSON` | MCP server status |
+| `get_mcp_status` | -- | `JSON` | MCP server status (no token — use `get_connect_url` for QR) |
+| `get_connect_url` | `ip` | `String` | Build QR connect URL server-side (token stays in backend) |
 | `check_update_channel` | `channel` | `UpdateCheckResult` | Check beta/nightly channel for updates (hardcoded URLs, SSRF-safe) |
 | `clear_caches` | -- | `()` | Clear in-memory caches |
 | `get_local_ip` | -- | `Option<String>` | Get primary local IP |
 | `get_local_ips` | -- | `Vec<LocalIpEntry>` | List local network interfaces |
-| `regenerate_session_token` | -- | `String` | Regenerate MCP session token |
+| `regenerate_session_token` | -- | `()` | Regenerate MCP session token (invalidates all remote sessions) |
 | `fetch_update_manifest` | `url` | `JSON` | Fetch update manifest via Rust HTTP (bypasses WebView CSP) |
 | `read_external_file` | `path` | `String` | Read file outside repo (standalone file open) |
 | `get_relay_status` | -- | `JSON` | Cloud relay connection status |

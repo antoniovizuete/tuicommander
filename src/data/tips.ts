@@ -97,7 +97,7 @@ export const TIPS: Tip[] = [
   {
     feature: "Voice Dictation",
     description: "Dictate into the active terminal — runs locally with Whisper, no network needed.",
-    shortcut: `${mod}+Shift+D`,
+    shortcut: null,
   },
   {
     feature: "Find in Content",
@@ -115,9 +115,19 @@ export const TIPS: Tip[] = [
     shortcut: `${mod}+G`,
   },
   {
-    feature: "Git Operations Panel",
-    description: "Pull, push, fetch, switch branches, create branches, and manage stash — all without leaving the panel. Background execution with inline feedback.",
-    shortcut: `${mod}+Shift+G`,
+    feature: "Git Panel",
+    description: "Stage, commit, browse history, and view blame — all in a tabbed side panel.",
+    shortcut: `${mod}+Shift+D`,
+  },
+  {
+    feature: "Commit Graph",
+    description: "The Log tab in the Git Panel shows a visual commit graph with color-coded lanes and branch connections.",
+    shortcut: null,
+  },
+  {
+    feature: "Blame Heatmap",
+    description: "The Blame sub-panel shows an age heatmap — recent changes are highlighted in green, older changes fade to neutral.",
+    shortcut: null,
   },
   {
     feature: "Tab Switching",
@@ -207,6 +217,11 @@ export const TIPS: Tip[] = [
   {
     feature: "File Drag & Drop",
     description: "Drag files from Finder onto the terminal area to open them — markdown in the viewer, code in the editor.",
+    shortcut: null,
+  },
+  {
+    feature: "Image Paste in Notes",
+    description: "Paste images into the Notes panel with Ctrl+V — thumbnails render inline, and paths are sent to agents so they can read the files.",
     shortcut: null,
   },
 ];

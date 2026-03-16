@@ -3,7 +3,7 @@
 > Canonical feature inventory. Update this file when adding, changing, or removing features.
 > See [AGENTS.md](../AGENTS.md) for the maintenance requirement.
 
-**Version:** 0.8.0 | **Last verified:** 2026-03-11
+**Version:** 0.9.0 | **Last verified:** 2026-03-14
 
 ---
 
@@ -14,7 +14,7 @@
 - Each tab runs an independent pseudo-terminal with the user's shell
 - Terminals are never unmounted — hidden tabs stay alive with full scroll history
 - Session persistence across app restarts (lazy restore on branch click)
-- Agent session restore shows a clickable banner ("Agent session was active — click to resume") instead of auto-injecting the resume command; banner is dismissible
+- Agent session restore shows a clickable banner ("Agent session was active — click to resume") instead of auto-injecting the resume command; Space/Enter resumes, other keys dismiss
 - Foreground process detection (macOS: `libproc`, Windows: `CreateToolhelp32Snapshot`)
 - PTY environment: `TERM=xterm-256color`, `COLORTERM=truecolor`, `LANG=en_US.UTF-8`
 - Pause/resume PTY output (`pause_pty` / `resume_pty` Tauri commands) — suspends reader thread without killing the session
@@ -175,11 +175,8 @@ Right-click the main worktree row → **Switch Branch** submenu to checkout a di
 - Min-width constraints prevent panels from collapsing (Markdown: 300px, File Browser: 200px)
 - Toggle buttons in status bar with hotkey hints visible during quick switcher
 
-### 3.2 Diff Panel (`Cmd+Shift+D`)
-- Scope selector dropdown: Working tree (default) or any of the last 5 commits
-- File list with change indicators
-- Click a file to open a dedicated inline diff tab in the main tab area
-- Auto-refreshes via repo watcher (`.git/` file change detection)
+### 3.2 ~~Diff Panel~~ (Removed in 0.9.0)
+Replaced by the Git Panel's Changes tab (section 3.8). `Cmd+Shift+D` now opens the Git Panel
 
 ### 3.3 Markdown Panel (`Cmd+M`)
 - Renders `.md` and `.mdx` files with syntax-highlighted code blocks
@@ -219,25 +216,52 @@ Right-click the main worktree row → **Switch Branch** submenu to checkout a di
 - Mark as used: notes sent to terminal are timestamped (`usedAt`) for tracking
 - Badge count: status bar toggle shows count of notes visible for the active repo
 - Per-repo filtering: notes can be tagged to a repository; untagged notes visible everywhere
+- **Image paste**: `Ctrl+V` / `Cmd+V` pastes clipboard images as thumbnails attached to the note
+  - Images saved to `config_dir()/note-images/<note-id>/` on disk
+  - Thumbnails displayed inline below note text and in the input area before submit
+  - Image-only notes (no text) are supported
+  - Images removed from disk when the note is deleted
+  - Send to terminal appends absolute image paths so AI agents can read them
+  - Max 10 MB per image; accepted formats: PNG, JPEG, WebP, GIF
+- Edit preserves note identity (in-place update, no ID change)
+- `Escape` cancels edit mode
 - Data persisted to Rust config backend
 
 ### 3.7 Help Panel (`Cmd+?`)
 - Shows app info and links (About, GitHub, docs)
 - Keyboard shortcuts are now in Settings > Keyboard Shortcuts tab (auto-generated from `actionRegistry.ts`)
 
-### 3.8 Git Operations Panel (`Cmd+Shift+G`)
-- 400px side panel with rich status card (branch, ahead/behind, staged/changed/stash counts, last commit)
-- Detached HEAD detection and display
-- Sync operations: Pull, Push, Fetch (background execution via `run_git_command`)
-- Branch operations: Switch, Merge (searchable BranchCombobox replaces native select)
-- Create Branch: inline form with name validation, Create and Create & Switch buttons
-- Stash operations: Stash, Pop with inline stash count
-- Conflict resolution: Merge/Rebase/Cherry-pick in-progress sections with Abort/Continue/Skip
-- Inline feedback bar: success (green, auto-dismiss) / error (red, persists)
-- Spinner on active operation button, all buttons disabled during execution
-- Keyboard: Escape to close, Tab navigation, autofocus on open
-- All icons are monochrome inline SVGs (no Unicode)
-- Single IPC round-trip via `get_git_panel_context`
+### 3.8 Git Panel (`Cmd+Shift+D`)
+Tabbed side panel with three tabs: Changes, Log, Stashes. Replaces the former Git Operations Panel floating overlay and the standalone Diff Panel.
+
+**Changes tab:**
+- Porcelain v2 working tree status via `get_working_tree_status` (branch, upstream, ahead/behind, stash count, staged/unstaged/untracked files)
+- Sync row: Pull, Push, Fetch buttons (background execution via `run_git_command`)
+- Stage / unstage individual files or stage all / unstage all
+- Discard unstaged changes (with confirmation dialog)
+- Inline commit form with message input and Amend toggle
+- Click a file row to open its diff in the diff panel
+- Status icons per file: Modified, Added, Deleted, Renamed, Untracked
+- Per-file diff counts (additions/deletions) shown inline
+- Glob filter to narrow the file list
+- Path-traversal validation on all stage/unstage/discard operations
+- **History sub-panel** (collapsible): per-file commit history via `get_file_history` (follows renames), paginated with virtual scroll
+- **Blame sub-panel** (collapsible): per-line blame via `get_file_blame` (porcelain format), age heatmap (green=recent, fading to neutral), commit metadata per line
+
+**Log tab:**
+- Paginated commit log via `get_commit_log` (default 50, max 500)
+- Virtual scroll via `@tanstack/solid-virtual` for large histories
+- Canvas-based commit graph via `get_commit_graph`: lane assignment, Bezier curve connections, 8-color palette, ref badges (branch, tag, HEAD). Graph follows HEAD only
+- Click a commit row to expand and see its changed files (via `get_changed_files`)
+- Relative timestamps (e.g., "3h ago")
+
+**Stashes tab:**
+- List all stash entries via `get_stash_list`
+- Per-stash actions: Apply, Pop, Drop (via `run_git_command`)
+
+**Keyboard navigation:**
+- `Escape` to close the panel
+- `Ctrl/Cmd+1–3` to switch between tabs
 - Auto-refreshes via repo revision subscription
 
 ### 3.9 Quick Branch Switch (`Cmd+B`)
@@ -354,7 +378,7 @@ Right-click the main worktree row → **Switch Branch** submenu to checkout a di
 - Ideas (lightbulb icon) — `Cmd+N`
 - File Browser (folder icon) — `Cmd+E`
 - Markdown (MD icon) — `Cmd+M`
-- Diff (diff icon) — `Cmd+Shift+D`
+- Git (diff icon) — `Cmd+Shift+D` (opens Git Panel)
 - Mic button (when dictation enabled): hold to record, release to transcribe
 
 ---
@@ -504,6 +528,7 @@ Every terminal tab has a stable UUID (`tuicSession`) injected as the `TUIC_SESSI
 - Base ref selection: choose which branch to start from when creating new worktrees
 - Per-repo settings: storage strategy, prompt on create, delete branch on remove, auto-archive, orphan cleanup, PR merge strategy, after-merge behavior
 - Setup script: runs once after creation (e.g., `npm install`)
+- Archive script: runs before a worktree is archived or deleted; non-zero exit blocks the operation
 - Merge & Archive: right-click → merge branch into main, then archive or delete based on setting
 - External worktree detection: monitors `.git/worktrees/` for changes from CLI or other tools
 - Remove via sidebar `×` button or context menu (with confirmation)
@@ -534,9 +559,10 @@ Every terminal tab has a stable UUID (`tuicSession`) injected as the `TUIC_SESSI
 - Binary detection via `resolve_cli()`
 
 ### 7.6 Diff
-- Working tree diff and per-commit diff (last 5 commits)
-- Per-file diff in dedicated tab
-- Diff stats: additions/deletions per branch
+- Working tree diff and per-commit diff via Git Panel Changes tab
+- Per-file diff counts (additions/deletions) shown inline in Changes tab
+- Click a file row to view its diff
+- Standalone DiffPanel removed in v0.9.0 (see section 3.2)
 
 ---
 
@@ -563,6 +589,7 @@ Every terminal tab has a stable UUID (`tuicSession`) injected as the `TUIC_SESSI
 - Merge button: visible when PR is open, approved, CI green — merges via GitHub API. Merge method auto-detected from repo-allowed methods; auto-fallback to squash on HTTP 405 rejection
 - Approve button: submit an approving review via GitHub API (remote-only PRs)
 - Post-merge cleanup dialog: after merge, offers checkable steps (switch to base, pull, delete local/remote branch)
+- Review button: if the branch's active agent has a run config named "review", spawns a terminal running the interpolated command with `{pr_number}`, `{branch}`, `{base_branch}`, `{repo}`, `{pr_url}`. Hidden when no matching config exists
 - Triggered from: sidebar PR badge, status bar PR badge, status bar CI badge, toolbar notification bell
 
 ### 8.4 PR Notifications
@@ -702,7 +729,8 @@ Every terminal tab has a stable UUID (`tuicSession`) injected as the `TUIC_SESSI
 ### 11.4 Repository Settings (per-repo)
 - Display name
 - Worktree tab: storage strategy, prompt on create, delete branch on remove, auto-archive, orphan cleanup, PR merge strategy, after-merge action (each overridable from global defaults)
-- Scripts tab: setup script (post-worktree), run script (`Cmd+R`)
+- Scripts tab: setup script (post-worktree), run script (`Cmd+R`), archive script (pre-archive/delete hook)
+- Repo-local config: `.tuic.json` in repo root provides team-shared settings. Three-tier precedence: `.tuic.json` > per-repo app settings > global defaults
 
 ### 11.5 Notifications
 - Master toggle, volume (0-100%)
@@ -739,6 +767,7 @@ All data persisted to platform config directory via Rust:
 - `prompt_library.json` — saved prompts
 - `notes.json` — ideas panel data
 - `dictation_config.json` — dictation settings
+- `.tuic.json` — repo-root team config (read-only from app, highest precedence for overridable fields)
 - `claude-usage-cache.json` — incremental session transcript parse cache
 
 ### 12.2 Hydration Safety
@@ -836,7 +865,7 @@ All data persisted to platform config directory via Rust:
 | Shortcut | Action |
 |----------|--------|
 | `Cmd+[` | Toggle sidebar |
-| `Cmd+Shift+D` | Toggle diff panel |
+| `Cmd+Shift+D` | Toggle Git Panel |
 | `Cmd+M` | Toggle markdown panel |
 | `Cmd+N` | Toggle Ideas panel |
 | `Cmd+E` | Toggle file browser |
@@ -854,7 +883,7 @@ All data persisted to platform config directory via Rust:
 |----------|--------|
 | `Cmd+B` | Quick branch switch (fuzzy search) |
 | `Cmd+G` | Open lazygit in terminal |
-| `Cmd+Shift+G` | Git operations panel |
+| `Cmd+Shift+D` | Git Panel |
 | `Cmd+Shift+L` | Lazygit in split pane |
 
 ### File Browser (when focused)
@@ -881,6 +910,8 @@ All data persisted to platform config directory via Rust:
 |----------|--------|
 | `Enter` | Submit idea |
 | `Shift+Enter` | Insert newline |
+| `Cmd+V` / `Ctrl+V` | Paste image from clipboard |
+| `Escape` | Cancel edit mode |
 
 ### Quick Switcher
 | Shortcut | Action |

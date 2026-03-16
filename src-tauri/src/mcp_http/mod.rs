@@ -1,5 +1,5 @@
 mod agent_routes;
-mod auth;
+pub(crate) mod auth;
 mod config_routes;
 mod fs_routes;
 mod git_routes;
@@ -117,7 +117,7 @@ impl axum::serve::Listener for NamedPipeListener {
                         {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!("MCP HTTP: failed to create next pipe instance: {e}");
+                                tracing::error!(source = "mcp_http", "Failed to create next pipe instance: {e}");
                                 // Sleep briefly then retry — the pipe name might be transiently busy
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 continue;
@@ -127,7 +127,7 @@ impl axum::serve::Listener for NamedPipeListener {
                     return (connected, PIPE_NAME.to_string());
                 }
                 Err(e) => {
-                    eprintln!("MCP HTTP: named pipe accept error: {e}");
+                    tracing::error!(source = "mcp_http", "Named pipe accept error: {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
@@ -229,6 +229,7 @@ pub fn build_router(state: Arc<AppState>, remote_auth: bool, mcp_enabled: bool) 
         .route("/metrics", get(session::get_metrics))
         // Git/GitHub
         .route("/repo/info", get(git_routes::repo_info))
+        .route("/repo/remote-url", get(git_routes::remote_url))
         .route("/repo/diff", get(git_routes::repo_diff))
         .route("/repo/diff-stats", get(git_routes::repo_diff_stats))
         .route("/repo/files", get(git_routes::repo_changed_files))
@@ -301,6 +302,22 @@ pub fn build_router(state: Arc<AppState>, remote_auth: bool, mcp_enabled: bool) 
         .route("/config/notes", get(config_routes::get_notes).put(config_routes::put_notes))
         // Recent commits
         .route("/repo/recent-commits", get(git_routes::get_recent_commits_http))
+        // GitPanel commands
+        .route("/repo/panel-context", get(git_routes::git_panel_context))
+        .route("/repo/run-git", post(git_routes::run_git_command_http))
+        .route("/repo/working-tree-status", get(git_routes::working_tree_status))
+        .route("/repo/stage", post(git_routes::stage_files_http))
+        .route("/repo/unstage", post(git_routes::unstage_files_http))
+        .route("/repo/discard", post(git_routes::discard_files_http))
+        .route("/repo/commit", post(git_routes::git_commit_http))
+        .route("/repo/commit-log", get(git_routes::commit_log_http))
+        .route("/repo/stash", get(git_routes::stash_list_http))
+        .route("/repo/stash/apply", post(git_routes::stash_apply_http))
+        .route("/repo/stash/pop", post(git_routes::stash_pop_http))
+        .route("/repo/stash/drop", post(git_routes::stash_drop_http))
+        .route("/repo/stash/show", get(git_routes::stash_show_http))
+        .route("/repo/file-history", get(git_routes::file_history_http))
+        .route("/repo/file-blame", get(git_routes::file_blame_http))
         // System
         .route("/system/local-ips", get(git_routes::get_local_ips_http))
         .route("/system/local-ip", get(git_routes::get_local_ip_http))
@@ -383,11 +400,11 @@ pub async fn start_server(state: Arc<AppState>, mcp_enabled: bool, remote_enable
         if let Some(parent) = sock.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
-            eprintln!("Warning: failed to create socket parent dir {}: {e}", parent.display());
+            tracing::warn!(source = "mcp_http", path = %parent.display(), "Failed to create socket parent dir: {e}");
         }
         match tokio::net::UnixListener::bind(&sock) {
             Ok(uds) => {
-                eprintln!("MCP HTTP: Unix socket listening on {}", sock.display());
+                tracing::info!(source = "mcp_http", path = %sock.display(), "Unix socket listening");
                 let app = build_router(state.clone(), false, true);
                 // Unix socket connections don't have a SocketAddr, but many route
                 // handlers extract ConnectInfo<SocketAddr> for localhost guards.
@@ -395,12 +412,12 @@ pub async fn start_server(state: Arc<AppState>, mcp_enabled: bool, remote_enable
                 let app = app.layer(axum::middleware::from_fn(inject_localhost_connect_info));
                 Some(tokio::spawn(async move {
                     if let Err(e) = axum::serve(uds, app.into_make_service()).await {
-                        eprintln!("MCP HTTP: Unix socket server error: {e}");
+                        tracing::error!(source = "mcp_http", "Unix socket server error: {e}");
                     }
                 }))
             }
             Err(e) => {
-                eprintln!("MCP HTTP: failed to bind Unix socket {}: {e}", sock.display());
+                tracing::error!(source = "mcp_http", path = %sock.display(), "Failed to bind Unix socket: {e}");
                 None
             }
         }
@@ -411,17 +428,17 @@ pub async fn start_server(state: Arc<AppState>, mcp_enabled: bool, remote_enable
     let pipe_handle = {
         match NamedPipeListener::new() {
             Ok(pipe) => {
-                eprintln!("MCP HTTP: Named pipe listening on {PIPE_NAME}");
+                tracing::info!(source = "mcp_http", pipe = PIPE_NAME, "Named pipe listening");
                 let app = build_router(state.clone(), false, true);
                 let app = app.layer(axum::middleware::from_fn(inject_localhost_connect_info));
                 Some(tokio::spawn(async move {
                     if let Err(e) = axum::serve(pipe, app.into_make_service()).await {
-                        eprintln!("MCP HTTP: Named pipe server error: {e}");
+                        tracing::error!(source = "mcp_http", "Named pipe server error: {e}");
                     }
                 }))
             }
             Err(e) => {
-                eprintln!("MCP HTTP: failed to create named pipe {PIPE_NAME}: {e}");
+                tracing::error!(source = "mcp_http", pipe = PIPE_NAME, "Failed to create named pipe: {e}");
                 None
             }
         }
@@ -440,7 +457,7 @@ pub async fn start_server(state: Arc<AppState>, mcp_enabled: bool, remote_enable
                 let addr = listener.local_addr().unwrap_or_else(|_| {
                     std::net::SocketAddr::from(([0, 0, 0, 0], 0))
                 });
-                eprintln!("MCP HTTP: TCP listening on {addr} (remote access enabled)");
+                tracing::info!(source = "mcp_http", %addr, "TCP listening (remote access enabled)");
 
                 let app = build_router(state.clone(), true, mcp_enabled);
                 Some(tokio::spawn(async move {
@@ -448,12 +465,12 @@ pub async fn start_server(state: Arc<AppState>, mcp_enabled: bool, remote_enable
                         listener,
                         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
                     ).await {
-                        eprintln!("MCP HTTP: TCP server error: {e}");
+                        tracing::error!(source = "mcp_http", "TCP server error: {e}");
                     }
                 }))
             }
             Err(e) => {
-                eprintln!("MCP HTTP: failed to bind TCP {bind_addr}: {e}");
+                tracing::error!(source = "mcp_http", bind_addr = %bind_addr, "Failed to bind TCP: {e}");
                 None
             }
         }
@@ -519,12 +536,6 @@ mod tests {
     }
 
     fn test_state() -> Arc<AppState> {
-        // Create blocking client on a separate OS thread because
-        // reqwest::blocking::Client::new() creates an internal tokio runtime
-        // which panics when constructed inside an existing async context (#[tokio::test]).
-        let http_client = std::thread::spawn(reqwest::blocking::Client::new)
-            .join()
-            .expect("blocking client construction thread panicked");
         Arc::new(AppState {
             sessions: DashMap::new(),
             worktrees_dir: std::env::temp_dir().join("test-worktrees"),
@@ -537,7 +548,7 @@ mod tests {
             head_watchers: DashMap::new(),
             repo_watchers: DashMap::new(),
             dir_watchers: DashMap::new(),
-            http_client: std::mem::ManuallyDrop::new(http_client),
+            http_client: reqwest::Client::new(),
             github_token: parking_lot::RwLock::new(None),
             github_circuit_breaker: crate::github::GitHubCircuitBreaker::new(),
             server_shutdown: parking_lot::Mutex::new(None),
@@ -550,7 +561,7 @@ mod tests {
             last_prompts: DashMap::new(),
             silence_states: DashMap::new(),
             claude_usage_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            log_buffer: parking_lot::Mutex::new(crate::app_logger::LogRingBuffer::new(crate::app_logger::LOG_RING_CAPACITY)),
+            log_buffer: std::sync::Arc::new(parking_lot::Mutex::new(crate::app_logger::LogRingBuffer::new(crate::app_logger::LOG_RING_CAPACITY))),
             event_bus: tokio::sync::broadcast::channel(256).0,
             event_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             session_states: dashmap::DashMap::new(),
@@ -558,6 +569,8 @@ mod tests {
             mcp_tools_changed: tokio::sync::broadcast::channel(16).0,
             slash_mode: DashMap::new(),
             last_output_ms: DashMap::new(),
+            shell_states: DashMap::new(),
+            loaded_plugins: DashMap::new(),
             relay: crate::state::RelayState::new(),
         })
     }
@@ -680,6 +693,85 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN,
             "Config save from non-loopback address should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_notification_config_rejects_non_loopback() {
+        let state = test_state();
+        let app = build_router(state, false, true);
+        let remote_addr = std::net::SocketAddr::from(([192, 168, 1, 100], 12345));
+        let body = serde_json::json!({"sound_enabled": false, "flash_enabled": false, "defer_secs": 10});
+        let resp = app.oneshot(put_from("/config/notifications", &body, remote_addr)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN,
+            "Notification config save from non-loopback should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_ui_prefs_rejects_non_loopback() {
+        let state = test_state();
+        let app = build_router(state, false, true);
+        let remote_addr = std::net::SocketAddr::from(([10, 0, 0, 1], 9999));
+        let body = serde_json::json!({});
+        let resp = app.oneshot(put_from("/config/ui-prefs", &body, remote_addr)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN,
+            "UI prefs save from non-loopback should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_repo_settings_rejects_non_loopback() {
+        let state = test_state();
+        let app = build_router(state, false, true);
+        let remote_addr = std::net::SocketAddr::from(([172, 16, 0, 5], 4000));
+        let body = serde_json::json!({});
+        let resp = app.oneshot(put_from("/config/repo-settings", &body, remote_addr)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN,
+            "Repo settings save from non-loopback should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_repositories_rejects_non_loopback() {
+        let state = test_state();
+        let app = build_router(state, false, true);
+        let remote_addr = std::net::SocketAddr::from(([192, 168, 1, 50], 8080));
+        let body = serde_json::json!({});
+        let resp = app.oneshot(put_from("/config/repositories", &body, remote_addr)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN,
+            "Repositories save from non-loopback should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_prompt_library_rejects_non_loopback() {
+        let state = test_state();
+        let app = build_router(state, false, true);
+        let remote_addr = std::net::SocketAddr::from(([10, 10, 10, 1], 3000));
+        let body = serde_json::json!({"prompts": []});
+        let resp = app.oneshot(put_from("/config/prompt-library", &body, remote_addr)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN,
+            "Prompt library save from non-loopback should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_notes_rejects_non_loopback() {
+        let state = test_state();
+        let app = build_router(state, false, true);
+        let remote_addr = std::net::SocketAddr::from(([192, 168, 0, 1], 5000));
+        let body = serde_json::json!({});
+        let resp = app.oneshot(put_from("/config/notes", &body, remote_addr)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN,
+            "Notes save from non-loopback should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_read_external_rejects_path_outside_repos() {
+        let state = test_state();
+        let app = build_router(state, false, true);
+        // No repos registered in test_state → any path should be rejected
+        let resp = app
+            .oneshot(Request::get("/fs/read-external?path=/etc/passwd").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN,
+            "read-external should reject paths outside registered repos");
     }
 
     // --- Path validation tests ---

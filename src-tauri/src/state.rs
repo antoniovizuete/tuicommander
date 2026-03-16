@@ -690,11 +690,8 @@ pub struct AppState {
     pub(crate) repo_watchers: DashMap<String, Debouncer<notify::RecommendedWatcher>>,
     /// File watchers for directory contents (keyed by absolute dir path)
     pub(crate) dir_watchers: DashMap<String, Debouncer<notify::RecommendedWatcher>>,
-    /// Shared HTTP client for GitHub API requests.
-    /// Wrapped in ManuallyDrop because reqwest::blocking::Client owns an internal
-    /// tokio runtime that panics on drop inside another runtime (e.g. #[tokio::test]).
-    /// The client lives for the app's lifetime, so never dropping it is harmless.
-    pub(crate) http_client: std::mem::ManuallyDrop<reqwest::blocking::Client>,
+    /// Shared async HTTP client for GitHub API requests.
+    pub(crate) http_client: reqwest::Client,
     /// GitHub API token — updated on fallback when a 401 triggers candidate rotation
     pub(crate) github_token: parking_lot::RwLock<Option<String>>,
     /// Circuit breaker for GitHub API calls
@@ -730,7 +727,8 @@ pub struct AppState {
     pub(crate) claude_usage_cache: Mutex<crate::claude_usage::SessionStatsCache>,
     /// Centralized application log ring buffer (1000 entries).
     /// Frontend pushes via push_log, reads via get_logs.
-    pub(crate) log_buffer: Mutex<crate::app_logger::LogRingBuffer>,
+    /// Wrapped in Arc so the tracing subscriber layer can share the same buffer.
+    pub(crate) log_buffer: Arc<Mutex<crate::app_logger::LogRingBuffer>>,
     /// Broadcast channel for all backend events (SSE, WebSocket, state accumulator).
     /// Capacity 256 — lagged receivers get `RecvError::Lagged` and should reconnect.
     pub(crate) event_bus: tokio::sync::broadcast::Sender<AppEvent>,
@@ -750,6 +748,15 @@ pub struct AppState {
     /// Updated by PTY reader on every non-empty chunk. Used to derive shell_state:
     /// "busy" when now - last < 500ms, "idle" otherwise (matches desktop model).
     pub(crate) last_output_ms: DashMap<String, AtomicU64>,
+    /// Per-session shell activity state (AtomicU8: 0=null, 1=busy, 2=idle).
+    /// Updated by the reader thread and silence timer via compare_exchange.
+    /// The single source of truth for busy/idle — the frontend consumes events,
+    /// it does not derive this state from raw PTY output timing.
+    pub(crate) shell_states: DashMap<String, std::sync::atomic::AtomicU8>,
+    /// Loaded plugin capabilities: plugin_id → list of capability strings.
+    /// Populated by the frontend via `register_loaded_plugin` on plugin load.
+    /// Used by Rust plugin commands to enforce capability checks server-side.
+    pub(crate) loaded_plugins: DashMap<String, Vec<String>>,
     /// Cloud relay client state
     pub(crate) relay: RelayState,
 }
@@ -778,6 +785,10 @@ pub(crate) struct GitCacheState {
     pub(crate) github_status: DashMap<String, (Vec<crate::github::BranchPrStatus>, Instant)>,
     pub(crate) git_status: DashMap<String, (crate::github::GitHubStatus, Instant)>,
     pub(crate) git_panel_context: DashMap<String, (crate::git::GitPanelContext, Instant)>,
+    /// Repos that returned null from GitHub GraphQL (not found / no access).
+    /// Keyed by "owner/name", value is the cooldown expiry time.
+    /// Excluded from batch queries until the cooldown expires (1 hour).
+    pub(crate) github_repo_cooldown: DashMap<String, Instant>,
 }
 
 impl GitCacheState {
@@ -788,6 +799,7 @@ impl GitCacheState {
             github_status: DashMap::new(),
             git_status: DashMap::new(),
             git_panel_context: DashMap::new(),
+            github_repo_cooldown: DashMap::new(),
         }
     }
 
@@ -798,6 +810,7 @@ impl GitCacheState {
         self.github_status.clear();
         self.git_status.clear();
         self.git_panel_context.clear();
+        self.github_repo_cooldown.clear();
     }
 
     /// Invalidate caches for a specific repo path.
@@ -920,7 +933,7 @@ impl AppState {
                 match rx.recv().await {
                     Ok(event) => Self::apply_event_to_session_state(&state, &event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("[session-state] lagged by {n} events");
+                        tracing::warn!(source = "session_state", lagged = n, "Event bus lagged");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -1715,7 +1728,7 @@ pub(crate) mod tests_support {
             head_watchers: dashmap::DashMap::new(),
             repo_watchers: dashmap::DashMap::new(),
             dir_watchers: dashmap::DashMap::new(),
-            http_client: std::mem::ManuallyDrop::new(reqwest::blocking::Client::new()),
+            http_client: reqwest::Client::new(),
             github_token: parking_lot::RwLock::new(None),
             github_circuit_breaker: crate::github::GitHubCircuitBreaker::new(),
             server_shutdown: parking_lot::Mutex::new(None),
@@ -1728,7 +1741,7 @@ pub(crate) mod tests_support {
             last_prompts: dashmap::DashMap::new(),
             silence_states: dashmap::DashMap::new(),
             claude_usage_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            log_buffer: parking_lot::Mutex::new(crate::app_logger::LogRingBuffer::new(crate::app_logger::LOG_RING_CAPACITY)),
+            log_buffer: Arc::new(parking_lot::Mutex::new(crate::app_logger::LogRingBuffer::new(crate::app_logger::LOG_RING_CAPACITY))),
             event_bus: tokio::sync::broadcast::channel(256).0,
             event_counter: Arc::new(AtomicU64::new(0)),
             session_states: DashMap::new(),
@@ -1736,6 +1749,8 @@ pub(crate) mod tests_support {
             mcp_tools_changed: tokio::sync::broadcast::channel(16).0,
             slash_mode: DashMap::new(),
             last_output_ms: DashMap::new(),
+            shell_states: DashMap::new(),
+            loaded_plugins: DashMap::new(),
             relay: RelayState::new(),
         }
     }
@@ -2075,7 +2090,7 @@ mod tests {
             head_watchers: dashmap::DashMap::new(),
             repo_watchers: dashmap::DashMap::new(),
             dir_watchers: dashmap::DashMap::new(),
-            http_client: std::mem::ManuallyDrop::new(reqwest::blocking::Client::new()),
+            http_client: reqwest::Client::new(),
             github_token: parking_lot::RwLock::new(None),
             github_circuit_breaker: crate::github::GitHubCircuitBreaker::new(),
             server_shutdown: parking_lot::Mutex::new(None),
@@ -2088,7 +2103,7 @@ mod tests {
             last_prompts: dashmap::DashMap::new(),
             silence_states: dashmap::DashMap::new(),
             claude_usage_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            log_buffer: parking_lot::Mutex::new(crate::app_logger::LogRingBuffer::new(crate::app_logger::LOG_RING_CAPACITY)),
+            log_buffer: Arc::new(parking_lot::Mutex::new(crate::app_logger::LogRingBuffer::new(crate::app_logger::LOG_RING_CAPACITY))),
             event_bus: tokio::sync::broadcast::channel(256).0,
             event_counter: Arc::new(AtomicU64::new(0)),
             session_states: DashMap::new(),
@@ -2096,6 +2111,8 @@ mod tests {
             mcp_tools_changed: tokio::sync::broadcast::channel(16).0,
             slash_mode: DashMap::new(),
             last_output_ms: DashMap::new(),
+            shell_states: DashMap::new(),
+            loaded_plugins: DashMap::new(),
             relay: RelayState::new(),
         }
     }

@@ -2,6 +2,17 @@
 
 Features to test when TUICommander is more usable.
 
+## Shell State Rust Derivation (741-3faf)
+- [ ] Agent runs → tab shows blue busy indicator
+- [ ] Agent stops → tab transitions to green idle (no mode-line flicker)
+- [ ] Agent asks "Procedo?" → question notification fires (no false completion)
+- [ ] Resize during idle → no brief blue flash on tab
+- [ ] pendingInitCommand (worktree run script) executes on first idle
+- [ ] Sub-agents running → terminal stays busy until they finish
+- [ ] Terminal remount (tab switch) correctly syncs shell state from Rust
+- [ ] Completion notification fires after agent works ≥5s then goes idle (background tab)
+- [ ] No completion notification when terminal is awaiting input (question/error)
+
 ## Plan Panel (515-660c / 516-41a5 / 517-74c2)
 - [ ] `Cmd+P` opens plan panel on right side
 - [ ] Plan panel shows plans only for the active repository
@@ -290,6 +301,14 @@ Features to test when TUICommander is more usable.
 - [ ] Shell without OSC 7 (vanilla bash) — no regression, behaves as before
 - [ ] Test with zsh (default macOS) — OSC 7 emitted by default
 - [ ] Test with fish — OSC 7 emitted natively
+
+## Remote-Only PR Badge (reported intermittent)
+- [ ] Blue badge with PR count visible on repo header when remote-only PRs exist
+- [ ] Badge appears after GitHub polling completes (may take a few seconds on startup)
+- [ ] NOT a collapsed-repo issue (confirmed by reporter)
+- [ ] Suspect: polling hasn't completed yet, or circuit breaker is open
+- [ ] Suspect: race between `localBranchNames()` update and GitHub poll — if branch names briefly match, PR is excluded from remote-only filter
+- [ ] To diagnose: check `githubStore.state.repos[path]` in console when badge is missing
 
 ## PWA / Mobile Output View
 - [ ] Normal text wraps on narrow screens (no horizontal scroll)

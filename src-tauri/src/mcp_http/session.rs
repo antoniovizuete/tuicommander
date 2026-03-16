@@ -17,6 +17,14 @@ use uuid::Uuid;
 
 use super::types::*;
 
+/// Standard 404 response for missing sessions.
+fn session_not_found() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "Session not found"})),
+    )
+}
+
 pub(super) async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
 }
@@ -54,12 +62,7 @@ pub(super) async fn write_to_session(
 ) -> impl IntoResponse {
     let entry = match state.sessions.get(&session_id) {
         Some(e) => e,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Session not found"})),
-            )
-        }
+        None => return session_not_found(),
     };
     let mut session = entry.lock();
     if let Err(e) = session.writer.write_all(body.data.as_bytes()) {
@@ -69,7 +72,7 @@ pub(super) async fn write_to_session(
         );
     }
     if let Err(e) = session.writer.flush() {
-        eprintln!("Warning: PTY flush failed for session {session_id}: {e}");
+        tracing::warn!(session_id = %session_id, "PTY flush failed: {e}");
     }
 
     // Feed input through InputLineBuffer FSM to track slash_mode accurately.
@@ -103,12 +106,7 @@ pub(super) async fn resize_session(
     }
     let entry = match state.sessions.get(&session_id) {
         Some(e) => e,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Session not found"})),
-            )
-        }
+        None => return session_not_found(),
     };
     let session = entry.lock();
     if let Err(e) = session.master.resize(PtySize {
@@ -141,12 +139,7 @@ pub(super) async fn get_output(
     if format == "log" {
         let vt_log = match state.vt_log_buffers.get(&session_id) {
             Some(b) => b,
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "Session not found"})),
-                )
-            }
+            None => return session_not_found(),
         };
         let buf = vt_log.lock();
         let limit = query.limit.unwrap_or(usize::MAX);
@@ -173,12 +166,7 @@ pub(super) async fn get_output(
     if format == "text" {
         let vt_log = match state.vt_log_buffers.get(&session_id) {
             Some(b) => b,
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "Session not found"})),
-                )
-            }
+            None => return session_not_found(),
         };
         let buf = vt_log.lock();
         let limit = query.limit.unwrap_or(usize::MAX);
@@ -205,12 +193,7 @@ pub(super) async fn get_output(
 
     let ring = match state.output_buffers.get(&session_id) {
         Some(r) => r,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Session not found"})),
-            )
-        }
+        None => return session_not_found(),
     };
     let limit = query.limit.unwrap_or(8192);
     let (bytes, total_written) = ring.lock().read_last(limit);
@@ -265,10 +248,7 @@ pub(super) async fn close_session(
 
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
+        session_not_found()
     }
 }
 
@@ -400,12 +380,7 @@ pub(super) async fn pause_session(
 ) -> impl IntoResponse {
     let entry = match state.sessions.get(&session_id) {
         Some(e) => e,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Session not found"})),
-            )
-        }
+        None => return session_not_found(),
     };
     entry.lock().paused.store(true, Ordering::Relaxed);
     state.metrics.pauses_triggered.fetch_add(1, Ordering::Relaxed);
@@ -418,12 +393,7 @@ pub(super) async fn resume_session(
 ) -> impl IntoResponse {
     let entry = match state.sessions.get(&session_id) {
         Some(e) => e,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Session not found"})),
-            )
-        }
+        None => return session_not_found(),
     };
     entry.lock().paused.store(false, Ordering::Relaxed);
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
@@ -641,7 +611,7 @@ async fn handle_ws_session(
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            eprintln!("[ws] broadcast lagged by {n} events for session {sid_for_events}");
+                            tracing::warn!(session_id = %sid_for_events, lagged = n, "WebSocket broadcast lagged");
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -659,11 +629,11 @@ async fn handle_ws_session(
                 if let Some(session) = state_clone.sessions.get(&sid) {
                     let mut s = session.lock();
                     if let Err(e) = s.writer.write_all(text.as_bytes()) {
-                        eprintln!("[ws] PTY write failed for session {sid}: {e}");
+                        tracing::error!(session_id = %sid, "PTY write failed: {e}");
                         break;
                     }
                     if let Err(e) = s.writer.flush() {
-                        eprintln!("[ws] PTY flush failed for session {sid}: {e}");
+                        tracing::warn!(session_id = %sid, "PTY flush failed: {e}");
                     }
                 }
             }
@@ -671,11 +641,11 @@ async fn handle_ws_session(
                 if let Some(session) = state_clone.sessions.get(&sid) {
                     let mut s = session.lock();
                     if let Err(e) = s.writer.write_all(&data) {
-                        eprintln!("[ws] PTY write failed for session {sid}: {e}");
+                        tracing::error!(session_id = %sid, "PTY write failed: {e}");
                         break;
                     }
                     if let Err(e) = s.writer.flush() {
-                        eprintln!("[ws] PTY flush failed for session {sid}: {e}");
+                        tracing::warn!(session_id = %sid, "PTY flush failed: {e}");
                     }
                 }
             }
@@ -862,7 +832,7 @@ async fn handle_ws_log_session(
                 if let Some(session) = state.sessions.get(&session_id) {
                     let mut s = session.lock();
                     if let Err(e) = s.writer.write_all(text.as_bytes()) {
-                        eprintln!("[ws/log] PTY write failed for session {session_id}: {e}");
+                        tracing::error!(session_id = %session_id, "PTY write failed: {e}");
                         break;
                     }
                     let _ = s.writer.flush();
@@ -872,7 +842,7 @@ async fn handle_ws_log_session(
                 if let Some(session) = state.sessions.get(&session_id) {
                     let mut s = session.lock();
                     if let Err(e) = s.writer.write_all(&data) {
-                        eprintln!("[ws/log] PTY write failed for session {session_id}: {e}");
+                        tracing::error!(session_id = %session_id, "PTY write failed: {e}");
                         break;
                     }
                     let _ = s.writer.flush();

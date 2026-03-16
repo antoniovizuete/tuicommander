@@ -88,6 +88,13 @@ pub enum ParsedEvent {
         count: u32,
         task_type: String, // "local agents", "bash", "background tasks", etc.
     },
+    /// Shell activity state derived from PTY output timing.
+    /// Emitted by the reader thread on real-output→busy and idle transitions.
+    /// The frontend consumes this instead of deriving busy/idle from raw PTY data.
+    #[serde(rename = "shell-state")]
+    ShellState {
+        state: String, // "busy" | "idle"
+    },
 }
 
 /// A single item in a slash command autocomplete menu.
@@ -916,7 +923,8 @@ pub fn colorize_intent(raw: &str) -> String {
         });
         // Strip SGR sequences so our dim-yellow is uninterrupted
         let body_clean = SGR_RE.replace_all(&body, "");
-        format!("\x1b[2;33mintent: {}\x1b[0m", body_clean)
+        let body_trimmed = body_clean.trim();
+        format!("\x1b[2;33mintent: {}\x1b[0m", body_trimmed)
     }).into_owned()
 }
 
@@ -2858,6 +2866,18 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             "CUF should become spaces; got: {:?}", colored);
         assert!(!colored.contains("(Prime session)"), "title stripped");
         assert!(!colored.contains("[["), "brackets stripped");
+    }
+
+    #[test]
+    fn test_colorize_intent_no_double_space_after_sgr_strip() {
+        // SGR sequences between "intent:" and the text can leave a leading space
+        // after stripping — the output must still have exactly one space.
+        let raw = "[[intent:\x1b[0m Reviewing terminal state(Reading state)]]";
+        let colored = colorize_intent(raw);
+        assert!(colored.contains("intent: Reviewing"),
+            "should have exactly one space after 'intent:'; got: {:?}", colored);
+        assert!(!colored.contains("intent:  "),
+            "must NOT have double space; got: {:?}", colored);
     }
 
     // --- parse_clean_lines tests ---

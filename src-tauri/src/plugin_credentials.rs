@@ -9,6 +9,12 @@
 #[cfg(not(target_os = "macos"))]
 use std::path::PathBuf;
 
+/// Validate service name format: alphanumeric, dots, hyphens, underscores, spaces.
+/// Prevents shell injection when service_name is passed to macOS `security` CLI.
+fn is_valid_service_name(name: &str) -> bool {
+    name.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' '))
+}
+
 /// Read a credential by service name.
 ///
 /// - macOS: reads from Keychain via `security find-generic-password`
@@ -19,19 +25,30 @@ use std::path::PathBuf;
 #[tauri::command]
 pub async fn plugin_read_credential(
     service_name: String,
-    _plugin_id: String,
+    plugin_id: String,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
 ) -> Result<Option<String>, String> {
+    crate::plugins::check_plugin_capability(&state, &plugin_id, "credentials:read")?;
+    plugin_read_credential_inner(&service_name)
+}
+
+fn plugin_read_credential_inner(service_name: &str) -> Result<Option<String>, String> {
     if service_name.is_empty() {
         return Err("Service name is empty".into());
+    }
+    // Validate format to prevent shell injection via macOS `security` CLI
+    // and credential enumeration. Allow alphanumeric, dots, hyphens, underscores, spaces.
+    if !is_valid_service_name(service_name) {
+        return Err("Service name contains invalid characters (allow: a-z A-Z 0-9 . - _ space)".into());
     }
 
     #[cfg(target_os = "macos")]
     {
-        read_from_keychain(&service_name)
+        read_from_keychain(service_name)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        read_from_json_file(&service_name)
+        read_from_json_file(service_name)
     }
 }
 
@@ -93,12 +110,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn valid_service_names() {
+        assert!(is_valid_service_name("Claude Code-credentials"));
+        assert!(is_valid_service_name("my_app.secret"));
+        assert!(is_valid_service_name("simple"));
+    }
+
+    #[test]
+    fn invalid_service_names() {
+        assert!(!is_valid_service_name("$(whoami)"));
+        assert!(!is_valid_service_name("test;rm -rf /"));
+        assert!(!is_valid_service_name("test\ninjection"));
+        assert!(!is_valid_service_name("path/../traversal"));
+        assert!(!is_valid_service_name("test`id`"));
+    }
+
+    #[test]
     fn empty_service_name_is_rejected() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(plugin_read_credential(
-            String::new(),
-            "test-plugin".to_string(),
-        ));
+        let result = plugin_read_credential_inner("");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("empty"));
     }

@@ -1,7 +1,14 @@
-import { createTabManager, makeBranchKey, type BaseTab } from "./tabManager";
-import { repositoriesStore } from "./repositories";
+import { createTabManager, type BaseTab } from "./tabManager";
+import { currentBranchKey } from "./repositories";
 
 export type DiffStatus = "M" | "A" | "D" | "R" | "?";
+
+const VALID_DIFF_STATUSES = new Set<string>(["M", "A", "D", "R", "?"]);
+
+/** Type guard for DiffStatus values received from backend */
+export function isDiffStatus(value: unknown): value is DiffStatus {
+  return typeof value === "string" && VALID_DIFF_STATUSES.has(value);
+}
 
 /** Diff tab data */
 export interface DiffTabData extends BaseTab {
@@ -11,15 +18,6 @@ export interface DiffTabData extends BaseTab {
   status: DiffStatus;
   scope?: string; // "working" (default) or "committed" (HEAD~1)
   untracked?: boolean; // True for "?" status files — skips redundant ls-files probe
-}
-
-/** Get the branch key for the currently active repo+branch */
-function currentBranchKey(): string | undefined {
-  const repoPath = repositoriesStore.state.activeRepoPath;
-  if (!repoPath) return undefined;
-  const repo = repositoriesStore.state.repositories[repoPath];
-  if (!repo?.activeBranch) return undefined;
-  return makeBranchKey(repoPath, repo.activeBranch);
 }
 
 function createDiffTabsStore() {

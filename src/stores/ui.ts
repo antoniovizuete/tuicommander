@@ -10,10 +10,10 @@ const SIDEBAR_MIN_WIDTH = 200;
 const SIDEBAR_MAX_WIDTH = 500;
 const SIDEBAR_DEFAULT_WIDTH = 300;
 
-const DIFF_PANEL_DEFAULT_WIDTH = 400;
 const MARKDOWN_PANEL_DEFAULT_WIDTH = 400;
 const NOTES_PANEL_DEFAULT_WIDTH = 350;
 const PLAN_PANEL_DEFAULT_WIDTH = 350;
+const GIT_PANEL_DEFAULT_WIDTH = 380;
 const SETTINGS_NAV_DEFAULT_WIDTH = 180;
 
 /** UI store state */
@@ -25,21 +25,18 @@ interface UIStoreState {
   sidebarWidth: number;
 
   // Panel visibility
-  diffPanelVisible: boolean;
   markdownPanelVisible: boolean;
   notesPanelVisible: boolean;
   fileBrowserPanelVisible: boolean;
   planPanelVisible: boolean;
+  gitPanelVisible: boolean;
 
   // Resizable panel widths (persisted)
-  diffPanelWidth: number;
   markdownPanelWidth: number;
   notesPanelWidth: number;
   planPanelWidth: number;
+  gitPanelWidth: number;
   settingsNavWidth: number;
-
-  // Diff panel state
-  currentDiffRepo: string | null;
 
   // Active dropdown (mutually exclusive)
   activeDropdown: "ide" | "font" | "agent" | null;
@@ -58,17 +55,16 @@ function createUIStore() {
   const [state, setState] = createStore<UIStoreState>({
     sidebarVisible: true,
     sidebarWidth: SIDEBAR_DEFAULT_WIDTH,
-    diffPanelVisible: false,
     markdownPanelVisible: false,
     notesPanelVisible: false,
     fileBrowserPanelVisible: false,
     planPanelVisible: false,
-    diffPanelWidth: DIFF_PANEL_DEFAULT_WIDTH,
+    gitPanelVisible: false,
     markdownPanelWidth: MARKDOWN_PANEL_DEFAULT_WIDTH,
     notesPanelWidth: NOTES_PANEL_DEFAULT_WIDTH,
     planPanelWidth: PLAN_PANEL_DEFAULT_WIDTH,
+    gitPanelWidth: GIT_PANEL_DEFAULT_WIDTH,
     settingsNavWidth: SETTINGS_NAV_DEFAULT_WIDTH,
-    currentDiffRepo: null,
     activeDropdown: null,
     isLoading: false,
     loadingMessage: "",
@@ -80,18 +76,40 @@ function createUIStore() {
       config: {
         sidebar_visible: state.sidebarVisible,
         sidebar_width: state.sidebarWidth,
-        diff_panel_visible: state.diffPanelVisible,
         markdown_panel_visible: state.markdownPanelVisible,
         notes_panel_visible: state.notesPanelVisible,
         file_browser_panel_visible: state.fileBrowserPanelVisible,
         plan_panel_visible: state.planPanelVisible,
-        diff_panel_width: state.diffPanelWidth,
+        git_panel_visible: state.gitPanelVisible,
         markdown_panel_width: state.markdownPanelWidth,
         notes_panel_width: state.notesPanelWidth,
         plan_panel_width: state.planPanelWidth,
+        git_panel_width: state.gitPanelWidth,
         settings_nav_width: state.settingsNavWidth,
       },
     }).catch((err) => appLogger.debug("store", "Failed to save UI prefs", err));
+  }
+
+  /** Keys of the mutually exclusive right-side panels */
+  type ExclusivePanel = "markdownPanelVisible" | "fileBrowserPanelVisible" | "planPanelVisible" | "gitPanelVisible";
+  const exclusivePanels: ExclusivePanel[] = [
+    "markdownPanelVisible",
+    "fileBrowserPanelVisible",
+    "planPanelVisible",
+    "gitPanelVisible",
+  ];
+
+  /** Open one exclusive panel and close the others, or close all if `key` is already open (toggle). */
+  function setExclusivePanel(key: ExclusivePanel, visible: boolean): void {
+    batch(() => {
+      setState(key, visible);
+      if (visible) {
+        for (const k of exclusivePanels) {
+          if (k !== key) setState(k, false);
+        }
+      }
+    });
+    saveUIPrefs();
   }
 
   const actions = {
@@ -115,15 +133,15 @@ function createUIStore() {
         const loaded = await invoke<{
           sidebar_visible?: boolean;
           sidebar_width?: number;
-          diff_panel_visible?: boolean;
           markdown_panel_visible?: boolean;
           notes_panel_visible?: boolean;
           file_browser_panel_visible?: boolean;
           plan_panel_visible?: boolean;
-          diff_panel_width?: number;
+          git_panel_visible?: boolean;
           markdown_panel_width?: number;
           notes_panel_width?: number;
           plan_panel_width?: number;
+          git_panel_width?: number;
           settings_nav_width?: number;
         }>("load_ui_prefs");
         if (loaded) {
@@ -132,9 +150,6 @@ function createUIStore() {
           }
           if (loaded.sidebar_width !== undefined) {
             setState("sidebarWidth", clampWidth(loaded.sidebar_width));
-          }
-          if (loaded.diff_panel_visible !== undefined) {
-            setState("diffPanelVisible", loaded.diff_panel_visible);
           }
           if (loaded.markdown_panel_visible !== undefined) {
             setState("markdownPanelVisible", loaded.markdown_panel_visible);
@@ -148,8 +163,8 @@ function createUIStore() {
           if (loaded.plan_panel_visible !== undefined) {
             setState("planPanelVisible", loaded.plan_panel_visible);
           }
-          if (loaded.diff_panel_width !== undefined) {
-            setState("diffPanelWidth", loaded.diff_panel_width);
+          if (loaded.git_panel_visible !== undefined) {
+            setState("gitPanelVisible", loaded.git_panel_visible);
           }
           if (loaded.markdown_panel_width !== undefined) {
             setState("markdownPanelWidth", loaded.markdown_panel_width);
@@ -160,6 +175,9 @@ function createUIStore() {
           if (loaded.plan_panel_width !== undefined) {
             setState("planPanelWidth", loaded.plan_panel_width);
           }
+          if (loaded.git_panel_width !== undefined) {
+            setState("gitPanelWidth", loaded.git_panel_width);
+          }
           if (loaded.settings_nav_width !== undefined) {
             setState("settingsNavWidth", loaded.settings_nav_width);
           }
@@ -169,55 +187,13 @@ function createUIStore() {
       }
     },
 
-    // Panel toggles — FB, MD, Diff are mutually exclusive
-    toggleDiffPanel(): void {
-      const next = !state.diffPanelVisible;
-      batch(() => {
-        setState("diffPanelVisible", next);
-        if (next) {
-          setState("markdownPanelVisible", false);
-          setState("fileBrowserPanelVisible", false);
-          setState("planPanelVisible", false);
-        }
-      });
-      saveUIPrefs();
-    },
-
+    // Panel toggles — mutually exclusive
     toggleMarkdownPanel(): void {
-      const next = !state.markdownPanelVisible;
-      batch(() => {
-        setState("markdownPanelVisible", next);
-        if (next) {
-          setState("diffPanelVisible", false);
-          setState("fileBrowserPanelVisible", false);
-          setState("planPanelVisible", false);
-        }
-      });
-      saveUIPrefs();
-    },
-
-    setDiffPanelVisible(visible: boolean): void {
-      batch(() => {
-        setState("diffPanelVisible", visible);
-        if (visible) {
-          setState("markdownPanelVisible", false);
-          setState("fileBrowserPanelVisible", false);
-          setState("planPanelVisible", false);
-        }
-      });
-      saveUIPrefs();
+      setExclusivePanel("markdownPanelVisible", !state.markdownPanelVisible);
     },
 
     setMarkdownPanelVisible(visible: boolean): void {
-      batch(() => {
-        setState("markdownPanelVisible", visible);
-        if (visible) {
-          setState("diffPanelVisible", false);
-          setState("fileBrowserPanelVisible", false);
-          setState("planPanelVisible", false);
-        }
-      });
-      saveUIPrefs();
+      setExclusivePanel("markdownPanelVisible", visible);
     },
 
     toggleNotesPanel(): void {
@@ -231,58 +207,27 @@ function createUIStore() {
     },
 
     toggleFileBrowserPanel(): void {
-      const next = !state.fileBrowserPanelVisible;
-      batch(() => {
-        setState("fileBrowserPanelVisible", next);
-        if (next) {
-          setState("diffPanelVisible", false);
-          setState("markdownPanelVisible", false);
-          setState("planPanelVisible", false);
-        }
-      });
-      saveUIPrefs();
+      setExclusivePanel("fileBrowserPanelVisible", !state.fileBrowserPanelVisible);
     },
 
     setFileBrowserPanelVisible(visible: boolean): void {
-      batch(() => {
-        setState("fileBrowserPanelVisible", visible);
-        if (visible) {
-          setState("diffPanelVisible", false);
-          setState("markdownPanelVisible", false);
-          setState("planPanelVisible", false);
-        }
-      });
-      saveUIPrefs();
+      setExclusivePanel("fileBrowserPanelVisible", visible);
     },
 
     togglePlanPanel(): void {
-      const next = !state.planPanelVisible;
-      batch(() => {
-        setState("planPanelVisible", next);
-        if (next) {
-          setState("diffPanelVisible", false);
-          setState("markdownPanelVisible", false);
-          setState("fileBrowserPanelVisible", false);
-        }
-      });
-      saveUIPrefs();
+      setExclusivePanel("planPanelVisible", !state.planPanelVisible);
     },
 
     setPlanPanelVisible(visible: boolean): void {
-      batch(() => {
-        setState("planPanelVisible", visible);
-        if (visible) {
-          setState("diffPanelVisible", false);
-          setState("markdownPanelVisible", false);
-          setState("fileBrowserPanelVisible", false);
-        }
-      });
-      saveUIPrefs();
+      setExclusivePanel("planPanelVisible", visible);
     },
 
-    // Diff repo selection
-    setCurrentDiffRepo(path: string | null): void {
-      setState("currentDiffRepo", path);
+    toggleGitPanel(): void {
+      setExclusivePanel("gitPanelVisible", !state.gitPanelVisible);
+    },
+
+    setGitPanelVisible(visible: boolean): void {
+      setExclusivePanel("gitPanelVisible", visible);
     },
 
     // Dropdown management
@@ -320,11 +265,6 @@ function createUIStore() {
     },
 
     // Panel widths
-    setDiffPanelWidth(width: number): void {
-      setState("diffPanelWidth", width);
-      saveUIPrefs();
-    },
-
     setMarkdownPanelWidth(width: number): void {
       setState("markdownPanelWidth", width);
       saveUIPrefs();
@@ -337,6 +277,11 @@ function createUIStore() {
 
     setPlanPanelWidth(width: number): void {
       setState("planPanelWidth", width);
+      saveUIPrefs();
+    },
+
+    setGitPanelWidth(width: number): void {
+      setState("gitPanelWidth", width);
       saveUIPrefs();
     },
 
@@ -353,10 +298,10 @@ function createUIStore() {
     resetLayout(): void {
       batch(() => {
         setState("sidebarWidth", SIDEBAR_DEFAULT_WIDTH);
-        setState("diffPanelWidth", DIFF_PANEL_DEFAULT_WIDTH);
         setState("markdownPanelWidth", MARKDOWN_PANEL_DEFAULT_WIDTH);
         setState("notesPanelWidth", NOTES_PANEL_DEFAULT_WIDTH);
         setState("planPanelWidth", PLAN_PANEL_DEFAULT_WIDTH);
+        setState("gitPanelWidth", GIT_PANEL_DEFAULT_WIDTH);
         setState("settingsNavWidth", SETTINGS_NAV_DEFAULT_WIDTH);
       });
       saveUIPrefs();

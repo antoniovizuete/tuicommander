@@ -86,8 +86,10 @@ fn validate_within_home(raw: &str) -> Result<PathBuf, String> {
 #[tauri::command]
 pub async fn plugin_read_file(
     path: String,
-    _plugin_id: String,
+    plugin_id: String,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
 ) -> Result<String, String> {
+    crate::plugins::check_plugin_capability(&state, &plugin_id, "fs:read")?;
     let canonical = validate_within_home(&path)?;
 
     // Check file size before reading
@@ -116,7 +118,16 @@ pub async fn plugin_read_file(
 pub async fn plugin_list_directory(
     path: String,
     pattern: Option<String>,
-    _plugin_id: String,
+    plugin_id: String,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
+) -> Result<Vec<String>, String> {
+    crate::plugins::check_plugin_capability(&state, &plugin_id, "fs:read")?;
+    plugin_list_directory_inner(path, pattern).await
+}
+
+async fn plugin_list_directory_inner(
+    path: String,
+    pattern: Option<String>,
 ) -> Result<Vec<String>, String> {
     let canonical = validate_within_home(&path)?;
 
@@ -155,7 +166,16 @@ pub async fn plugin_list_directory(
 pub async fn plugin_read_file_tail(
     path: String,
     max_bytes: u64,
-    _plugin_id: String,
+    plugin_id: String,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
+) -> Result<String, String> {
+    crate::plugins::check_plugin_capability(&state, &plugin_id, "fs:read")?;
+    plugin_read_file_tail_inner(path, max_bytes).await
+}
+
+async fn plugin_read_file_tail_inner(
+    path: String,
+    max_bytes: u64,
 ) -> Result<String, String> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -344,7 +364,17 @@ const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
 pub async fn plugin_write_file(
     path: String,
     content: String,
-    _plugin_id: String,
+    plugin_id: String,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
+) -> Result<(), String> {
+    crate::plugins::check_plugin_capability(&state, &plugin_id, "fs:write")?;
+    plugin_write_file_inner(path, content).await
+}
+
+/// Core write logic, separated from the Tauri command wrapper for testability.
+async fn plugin_write_file_inner(
+    path: String,
+    content: String,
 ) -> Result<(), String> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(format!(
@@ -395,7 +425,16 @@ pub async fn plugin_write_file(
 pub async fn plugin_rename_path(
     from: String,
     to: String,
-    _plugin_id: String,
+    plugin_id: String,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
+) -> Result<(), String> {
+    crate::plugins::check_plugin_capability(&state, &plugin_id, "fs:rename")?;
+    plugin_rename_path_inner(from, to).await
+}
+
+async fn plugin_rename_path_inner(
+    from: String,
+    to: String,
 ) -> Result<(), String> {
     let from_path = validate_within_home(&from)?;
 
@@ -524,10 +563,9 @@ mod tests {
         std::fs::write(&test_file, "line1\nline2\nline3\n").unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(plugin_read_file_tail(
+        let result = rt.block_on(plugin_read_file_tail_inner(
             test_file.to_string_lossy().to_string(),
             1024,
-            "test".to_string(),
         ));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "line1\nline2\nline3\n");
@@ -542,10 +580,9 @@ mod tests {
         std::fs::write(&test_file, content).unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(plugin_read_file_tail(
+        let result = rt.block_on(plugin_read_file_tail_inner(
             test_file.to_string_lossy().to_string(),
             12,
-            "test".to_string(),
         ));
         assert!(result.is_ok());
         let text = result.unwrap();
@@ -557,10 +594,9 @@ mod tests {
         let _guard = FS_TEST_LOCK.lock().unwrap();
         let home = dirs::home_dir().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(plugin_read_file_tail(
+        let result = rt.block_on(plugin_read_file_tail_inner(
             home.to_string_lossy().to_string(),
             1024,
-            "test".to_string(),
         ));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not a file"));
@@ -595,10 +631,9 @@ mod tests {
         let test_file = tmp.path().join("write-new.txt");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(plugin_write_file(
+        let result = rt.block_on(plugin_write_file_inner(
             test_file.to_string_lossy().to_string(),
             "hello write".to_string(),
-            "test".to_string(),
         ));
         let content = std::fs::read_to_string(&test_file).unwrap_or_default();
 
@@ -614,10 +649,9 @@ mod tests {
         let _ = std::fs::write(&test_file, "old content");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(plugin_write_file(
+        let result = rt.block_on(plugin_write_file_inner(
             test_file.to_string_lossy().to_string(),
             "new content".to_string(),
-            "test".to_string(),
         ));
         let content = std::fs::read_to_string(&test_file).unwrap_or_default();
 
@@ -628,10 +662,9 @@ mod tests {
     #[test]
     fn write_file_rejects_relative_path() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(plugin_write_file(
+        let result = rt.block_on(plugin_write_file_inner(
             "relative/file.txt".to_string(),
             "content".to_string(),
-            "test".to_string(),
         ));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("absolute"));
@@ -643,10 +676,9 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         if !Path::new("/tmp").starts_with(&home) {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(plugin_write_file(
+            let result = rt.block_on(plugin_write_file_inner(
                 "/tmp/.tuic-test-write-outside.txt".to_string(),
                 "content".to_string(),
-                "test".to_string(),
             ));
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("home directory"));
@@ -661,10 +693,9 @@ mod tests {
         let _ = std::fs::create_dir_all(&test_dir);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(plugin_write_file(
+        let result = rt.block_on(plugin_write_file_inner(
             test_dir.to_string_lossy().to_string(),
             "content".to_string(),
-            "test".to_string(),
         ));
 
         assert!(result.is_err());
@@ -682,10 +713,9 @@ mod tests {
         let _ = std::fs::write(&from, "rename me");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(plugin_rename_path(
+        let result = rt.block_on(plugin_rename_path_inner(
             from.to_string_lossy().to_string(),
             to.to_string_lossy().to_string(),
-            "test".to_string(),
         ));
         let content = std::fs::read_to_string(&to).unwrap_or_default();
         let from_exists = from.exists();
@@ -701,10 +731,9 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         if !Path::new("/tmp").starts_with(&home) {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(plugin_rename_path(
+            let result = rt.block_on(plugin_rename_path_inner(
                 "/tmp/.tuic-test-rename.txt".to_string(),
                 home.join(".tuic-test-rename-dest.txt").to_string_lossy().to_string(),
-                "test".to_string(),
             ));
             assert!(result.is_err());
         }
@@ -718,10 +747,9 @@ mod tests {
         let _ = std::fs::write(&from, "test");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(plugin_rename_path(
+        let result = rt.block_on(plugin_rename_path_inner(
             from.to_string_lossy().to_string(),
             "relative/dest.txt".to_string(),
-            "test".to_string(),
         ));
 
         assert!(result.is_err());

@@ -21,13 +21,13 @@ import { PromptDrawer } from "./components/PromptDrawer";
 import { SettingsPanel, type SettingsContext } from "./components/SettingsPanel";
 import { TaskQueuePanel } from "./components/TaskQueuePanel";
 import { ContextMenu, createContextMenu, type ContextMenuItem } from "./components/ContextMenu";
-import { GitOperationsPanel } from "./components/GitOperationsPanel";
 import { RenameBranchDialog } from "./components/RenameBranchDialog";
 import { CreateWorktreeDialog } from "./components/CreateWorktreeDialog";
 import { PromptDialog } from "./components/PromptDialog";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { PostMergeCleanupDialog, type StepId, type StepStatus, type CleanupStep } from "./components/PostMergeCleanupDialog/PostMergeCleanupDialog";
 import { executeCleanup } from "./hooks/usePostMergeCleanup";
+import { getCompletionSuppression } from "./components/Terminal/completionDecision";
 import { RunCommandDialog } from "./components/RunCommandDialog";
 import { HelpPanel } from "./components/HelpPanel";
 import { CommandPalette } from "./components/CommandPalette";
@@ -126,7 +126,6 @@ const App: Component = () => {
     setSettingsPanelVisible(true);
   };
   const [taskQueueVisible, setTaskQueueVisible] = createSignal(false);
-  const [gitOpsPanelVisible, setGitOpsPanelVisible] = createSignal(false);
 
   // Help panel state (Story 053)
   const [helpPanelVisible, setHelpPanelVisible] = createSignal(false);
@@ -389,14 +388,20 @@ const App: Component = () => {
 
     const fireCompletion = () => {
       deferredCompletionTimers.delete(id);
-      // Re-check: terminal may have become active or gone busy during the wait.
-      if (terminalsStore.state.activeId === id) return;
-      if (terminalsStore.state.debouncedBusy[id]) return;
-      // Re-check sub-tasks: count may have updated during deferral.
+      // Re-check: terminal may have been removed during deferral.
       const terminal = terminalsStore.get(id);
-      if (!terminal) return; // Terminal removed during deferral
-      if (terminal.activeSubTasks > 0) {
-        appLogger.debug("terminal", `[Notify] ${id} completion SUPPRESSED — ${terminal.activeSubTasks} active sub-tasks`);
+      if (!terminal) return;
+
+      const reason = getCompletionSuppression({
+        isActiveTerminal: terminalsStore.state.activeId === id,
+        isDebouncedBusy: !!terminalsStore.state.debouncedBusy[id],
+        activeSubTasks: terminal.activeSubTasks,
+        awaitingInput: terminal.awaitingInput,
+        durationMs,
+        thresholdMs: BUSY_COMPLETION_THRESHOLD_MS,
+      });
+      if (reason) {
+        appLogger.debug("terminal", `[Notify] ${id} completion SUPPRESSED — ${reason}`);
         return;
       }
       appLogger.info("terminal", `[Notify] ${id} completion — busy for ${Math.round(durationMs / 1000)}s then idle`);
@@ -854,13 +859,12 @@ const App: Component = () => {
     lazygitAvailable: lazygit.lazygitAvailable,
     spawnLazygit: lazygit.spawnLazygit,
     openLazygitPane: lazygit.openLazygitPane,
-    toggleDiffPanel: uiStore.toggleDiffPanel,
     toggleMarkdownPanel: uiStore.toggleMarkdownPanel,
     toggleSidebar: uiStore.toggleSidebar,
     togglePromptLibrary: promptLibraryStore.toggleDrawer,
     toggleSettings: () => setSettingsPanelVisible((v) => !v),
     toggleTaskQueue: () => setTaskQueueVisible((v) => !v),
-    toggleGitOpsPanel: () => setGitOpsPanelVisible((v) => !v),
+    toggleGitOpsPanel: uiStore.toggleGitPanel,
     toggleHelpPanel: () => setHelpPanelVisible((v) => !v),
     toggleNotesPanel: uiStore.toggleNotesPanel,
     toggleFileBrowserPanel: uiStore.toggleFileBrowserPanel,
@@ -1048,7 +1052,7 @@ const App: Component = () => {
         case "zoom-in": terminalLifecycle.zoomIn(); break;
         case "zoom-out": terminalLifecycle.zoomOut(); break;
         case "zoom-reset": terminalLifecycle.zoomReset(); break;
-        case "diff-panel": uiStore.toggleDiffPanel(); break;
+        case "diff-panel": uiStore.toggleGitPanel(); break;
         case "markdown-panel": uiStore.toggleMarkdownPanel(); break;
         case "notes-panel": uiStore.toggleNotesPanel(); break;
         case "file-browser": uiStore.toggleFileBrowserPanel(); break;
@@ -1063,7 +1067,7 @@ const App: Component = () => {
         case "edit-run-command": gitOps.handleRunCommand(true, () => setRunCommandDialogVisible(true)); break;
         case "lazygit": if (lazygit.lazygitAvailable()) lazygit.spawnLazygit(); break;
         case "lazygit-split": if (lazygit.lazygitAvailable()) lazygit.openLazygitPane(); break;
-        case "git-operations": setGitOpsPanelVisible((v) => !v); break;
+        case "git-operations": uiStore.toggleGitPanel(); break;
         case "task-queue": setTaskQueueVisible((v) => !v); break;
 
         // Help
@@ -1150,6 +1154,7 @@ const App: Component = () => {
           }
         }}
         onRun={(shiftKey) => gitOps.handleRunCommand(shiftKey, () => setRunCommandDialogVisible(true))}
+        onReviewPr={gitOps.handleReviewPr}
       />
 
       {/* Body: sidebar + main content side by side */}
@@ -1195,6 +1200,7 @@ const App: Component = () => {
           currentBranches={gitOps.currentBranches()}
           onBackgroundGit={handleBackgroundGit}
           runningGitOps={runningGitOps()}
+          onReviewPr={gitOps.handleReviewPr}
         />
 
         {/* Main content */}
@@ -1256,7 +1262,7 @@ const App: Component = () => {
           fontSize={terminalLifecycle.activeFontSize()}
           defaultFontSize={getDefaultFontSize()}
           statusInfo={statusInfo()}
-          onToggleDiff={() => uiStore.toggleDiffPanel()}
+          onToggleDiff={() => uiStore.toggleGitPanel()}
           onToggleMarkdown={() => uiStore.toggleMarkdownPanel()}
           onToggleNotes={() => uiStore.toggleNotesPanel()}
           onToggleFileBrowser={() => uiStore.toggleFileBrowserPanel()}
@@ -1275,6 +1281,7 @@ const App: Component = () => {
             }
             setStatusInfo(`Renamed branch ${oldName} to ${newName}`);
           }}
+          onReviewPr={gitOps.handleReviewPr}
         />
         </main>
       </div>
@@ -1332,24 +1339,6 @@ const App: Component = () => {
         onClose={() => setTaskQueueVisible(false)}
       />
 
-      {/* Git operations panel */}
-      <GitOperationsPanel
-        visible={gitOpsPanelVisible()}
-        repoPath={gitOps.currentRepoPath() || null}
-        onClose={() => setGitOpsPanelVisible(false)}
-        onBranchChange={() => {
-          // Refresh repo info after git operation
-          if (gitOps.currentRepoPath()) {
-            repo.getInfo(gitOps.currentRepoPath()!).then((info) => {
-              gitOps.setCurrentBranch(info.branch);
-              gitOps.setRepoStatus(info.status === "not-git" ? "unknown" : info.status);
-            }).catch((err) => {
-              appLogger.error("git", "Failed to refresh repo info", err);
-              gitOps.setRepoStatus("unknown");
-            });
-          }
-        }}
-      />
 
       {/* Context menu */}
       <ContextMenu

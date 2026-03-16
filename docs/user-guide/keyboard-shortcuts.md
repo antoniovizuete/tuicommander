@@ -20,7 +20,7 @@ The file is a JSON array of override objects. Only include shortcuts you want to
 
 ```json
 [
-  { "action": "toggle-diff", "key": "Cmd+Shift+Y" },
+  { "action": "toggle-git-ops", "key": "Cmd+Shift+Y" },
   { "action": "toggle-markdown", "key": "Cmd+Shift+M" }
 ]
 ```
@@ -82,7 +82,7 @@ Font size range: 8px to 32px, step 2px per action.
 | Shortcut | Action |
 |----------|--------|
 | `Cmd+[` | Toggle sidebar |
-| `Cmd+Shift+D` | Toggle diff panel |
+| `Cmd+Shift+D` | Toggle Git Panel |
 | `Cmd+M` | Toggle markdown panel |
 | `Cmd+N` | Toggle Ideas panel |
 | `Cmd+E` | Toggle file browser |
@@ -91,15 +91,24 @@ Font size range: 8px to 32px, step 2px per action.
 | `Cmd+K` | Prompt library |
 | `Cmd+Shift+W` | Worktree Manager |
 | `Cmd+J` | Task queue |
+| `Cmd+P` | Toggle plan panel |
+| `Cmd+Shift+E` | Toggle error log |
 
-Note: File browser, Markdown, and Diff panels are mutually exclusive — opening one closes any other that is open.
+Note: File browser and Markdown panels are mutually exclusive — opening one closes the other.
+
+## Navigation
+
+| Shortcut | Action |
+|----------|--------|
+| `Cmd+Shift+P` | Command palette |
+| `Cmd+Shift+A` | Activity dashboard |
 
 ## Git & Lazygit
 
 | Shortcut | Action |
 |----------|--------|
 | `Cmd+G` | Open lazygit in terminal |
-| `Cmd+Shift+G` | Git operations panel |
+| `Cmd+Shift+D` | Git Panel |
 | `Cmd+Shift+L` | Lazygit in split pane |
 | `Cmd+B` | Quick branch switch (fuzzy search) |
 
@@ -168,7 +177,7 @@ Hold to record, release to transcribe and inject text into active terminal.
 | Drag | Sidebar right edge | Resize sidebar (200-500px) |
 | Click | PR badge / CI ring | Open PR detail popover |
 | Click | Status bar CWD path | Copy path to clipboard |
-| Click | Status bar panel buttons | Toggle Diff/MD/FB/Ideas panels |
+| Click | Status bar panel buttons | Toggle Git/MD/FB/Ideas panels |
 | Drag | Panel left edge | Resize right-side panel (200-800px) |
 | Drag | Split pane divider | Resize split terminal panes |
 
@@ -191,7 +200,6 @@ Hold to record, release to transcribe and inject text into active terminal.
 | `next-tab` | `Cmd+Shift+]` | Next tab |
 | `switch-tab-1..9` | `Cmd+1..9` | Switch to tab N |
 | `toggle-sidebar` | `Cmd+[` | Toggle sidebar |
-| `toggle-diff` | `Cmd+Shift+D` | Toggle diff panel |
 | `toggle-markdown` | `Cmd+M` | Toggle markdown panel |
 | `toggle-notes` | `Cmd+N` | Toggle ideas panel |
 | `toggle-file-browser` | `Cmd+E` | Toggle file browser |
@@ -199,10 +207,14 @@ Hold to record, release to transcribe and inject text into active terminal.
 | `toggle-settings` | `Cmd+,` | Open settings |
 | `toggle-task-queue` | `Cmd+J` | Task queue |
 | `toggle-help` | `Cmd+?` | Toggle help panel |
-| `toggle-git-ops` | `Cmd+Shift+G` | Git operations panel |
+| `toggle-git-ops` | `Cmd+Shift+D` | Git Panel |
 | `open-lazygit` | `Cmd+G` | Open lazygit |
 | `open-lazygit-pane` | `Cmd+Shift+L` | Lazygit split pane |
 | `worktree-manager` | `Cmd+Shift+W` | Worktree Manager panel |
 | `quick-branch-switch` | `Cmd+B` | Quick branch switch |
 | `find-in-terminal` | `Cmd+F` | Find in terminal |
+| `command-palette` | `Cmd+Shift+P` | Command palette |
+| `activity-dashboard` | `Cmd+Shift+A` | Activity dashboard |
+| `toggle-error-log` | `Cmd+Shift+E` | Toggle error log |
+| `toggle-plan` | `Cmd+P` | Toggle plan panel |
 | `switch-branch-1..9` | `Cmd+Ctrl+1..9` | Switch to branch N |

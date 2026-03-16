@@ -11,6 +11,7 @@ pub(crate) mod fs;
 mod input_line_buffer;
 pub(crate) mod git;
 pub(crate) mod git_cli;
+pub(crate) mod git_graph;
 pub(crate) mod github;
 pub(crate) mod head_watcher;
 pub(crate) mod repo_watcher;
@@ -79,18 +80,18 @@ fn ensure_window_visible(window: &WebviewWindow) {
         });
 
     if size_invalid || !on_screen {
-        eprintln!(
-            "[WindowGuard] Invalid window state ({}x{} at {},{}) — resetting to defaults",
-            size.width, size.height, pos.x, pos.y
+        tracing::warn!(
+            width = size.width, height = size.height, x = pos.x, y = pos.y,
+            "Invalid window state — resetting to defaults"
         );
         if let Err(e) = window.set_size(tauri::PhysicalSize::new(1200u32, 800u32)) {
-            eprintln!("[WindowGuard] Failed to reset size: {e}");
+            tracing::warn!("Failed to reset window size: {e}");
         }
         if let Err(e) = window.set_position(PhysicalPosition::new(100i32, 100i32)) {
-            eprintln!("[WindowGuard] Failed to reset position: {e}");
+            tracing::warn!("Failed to reset window position: {e}");
         }
         if let Err(e) = window.center() {
-            eprintln!("[WindowGuard] Failed to center window: {e}");
+            tracing::warn!("Failed to center window: {e}");
         }
     }
 }
@@ -227,6 +228,10 @@ fn enumerate_unix_ips(ipv6_enabled: bool) -> Vec<LocalIpEntry> {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     let mut result = Vec::new();
+    // SAFETY: `getifaddrs` writes a valid linked list to `ifap` on success (return 0).
+    // Each node's `ifa_addr` is checked for null before dereferencing. Pointer casts
+    // to `sockaddr_in`/`sockaddr_in6` are valid only after verifying `sa_family`.
+    // `freeifaddrs` is called unconditionally after traversal to free the list.
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifap) != 0 {
@@ -476,13 +481,12 @@ fn read_external_file(path: String) -> Result<String, String> {
 #[tauri::command]
 async fn get_mcp_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     // Collect config and session count synchronously first (fast, no I/O)
-    let (remote_enabled, active_sessions, mcp_protocol_sessions, session_token) = {
+    let (remote_enabled, active_sessions, mcp_protocol_sessions) = {
         let cfg = state.config.read();
         (
             cfg.remote_access_enabled,
             state.sessions.len(),
             state.mcp_sessions.len(),
-            state.session_token.read().clone(),
         )
     };
 
@@ -526,18 +530,24 @@ async fn get_mcp_status(state: State<'_, Arc<AppState>>) -> Result<serde_json::V
         "active_sessions": active_sessions,
         "mcp_clients": mcp_protocol_sessions,
         "max_sessions": MAX_CONCURRENT_SESSIONS,
-        "session_token": session_token,
         "reachable": reachable,
     }))
 }
 
 /// Regenerate the session token, invalidating all existing remote sessions.
-/// Returns the new token so the frontend can refresh the QR code.
 #[tauri::command]
-fn regenerate_session_token(state: State<'_, Arc<AppState>>) -> String {
+fn regenerate_session_token(state: State<'_, Arc<AppState>>) {
     let new_token = uuid::Uuid::new_v4().to_string();
-    *state.session_token.write() = new_token.clone();
-    new_token
+    *state.session_token.write() = new_token;
+}
+
+/// Build a QR-code connect URL server-side so the raw session token
+/// never reaches JS (where a malicious plugin could steal it).
+#[tauri::command]
+fn get_connect_url(state: State<'_, Arc<AppState>>, ip: String) -> String {
+    let port = state.config.read().remote_access_port;
+    let token = state.session_token.read().clone();
+    build_connect_url(&ip, port, &token)
 }
 
 /// Get relay client status (enabled, connected, url, session_id).
@@ -555,6 +565,14 @@ fn get_relay_status(state: State<'_, Arc<AppState>>) -> serde_json::Value {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Create the shared log ring buffer and initialise the tracing subscriber.
+    // This must happen before any other code so all log output is captured —
+    // including config loading, migration warnings, etc.
+    let log_buffer = Arc::new(parking_lot::Mutex::new(
+        app_logger::LogRingBuffer::new(app_logger::LOG_RING_CAPACITY),
+    ));
+    app_logger::init_tracing(log_buffer.clone());
+
     // Default worktrees directory: <config_dir>/worktrees
     let worktrees_dir = config::config_dir().join("worktrees");
 
@@ -562,7 +580,7 @@ pub fn run() {
 
     let github_token = crate::github::resolve_github_token();
     if github_token.is_none() {
-        eprintln!("[github] No GitHub token found (checked GH_TOKEN, GITHUB_TOKEN, gh CLI config)");
+        tracing::warn!(source = "github", "No GitHub token found (checked GH_TOKEN, GITHUB_TOKEN, gh CLI config)");
     }
 
     let state = Arc::new(AppState {
@@ -577,7 +595,7 @@ pub fn run() {
         head_watchers: DashMap::new(),
         repo_watchers: DashMap::new(),
         dir_watchers: DashMap::new(),
-        http_client: std::mem::ManuallyDrop::new(reqwest::blocking::Client::new()),
+        http_client: reqwest::Client::new(),
         github_token: parking_lot::RwLock::new(github_token),
         github_circuit_breaker: crate::github::GitHubCircuitBreaker::new(),
         server_shutdown: parking_lot::Mutex::new(None),
@@ -590,7 +608,7 @@ pub fn run() {
         last_prompts: DashMap::new(),
         silence_states: DashMap::new(),
         claude_usage_cache: parking_lot::Mutex::new(claude_usage::load_cache_from_disk()),
-        log_buffer: parking_lot::Mutex::new(app_logger::LogRingBuffer::new(app_logger::LOG_RING_CAPACITY)),
+        log_buffer,
         event_bus: tokio::sync::broadcast::channel(256).0,
         event_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         session_states: dashmap::DashMap::new(),
@@ -598,6 +616,8 @@ pub fn run() {
         mcp_tools_changed: tokio::sync::broadcast::channel(16).0,
         slash_mode: DashMap::new(),
         last_output_ms: DashMap::new(),
+        shell_states: DashMap::new(),
+        loaded_plugins: DashMap::new(),
         relay: crate::state::RelayState::new(),
     });
 
@@ -659,7 +679,7 @@ pub fn run() {
                     // External URL — open in system browser, block webview navigation
                     if scheme == "http" || scheme == "https" {
                         let url_str = url.to_string();
-                        eprintln!("[NavigationGuard] Opening in browser: {url_str}");
+                        tracing::info!(url = %url_str, "Opening external URL in browser");
                         #[cfg(target_os = "macos")]
                         let _ = std::process::Command::new("open").arg(&url_str).spawn();
                         #[cfg(target_os = "linux")]
@@ -745,6 +765,7 @@ pub fn run() {
             pty::resume_pty,
             pty::get_kitty_flags,
             pty::get_last_prompt,
+            pty::get_shell_state,
             pty::close_pty,
             worktree::get_worktrees_dir,
             git::get_repo_info,
@@ -790,6 +811,19 @@ pub fn run() {
             git::get_initials,
             git::run_git_command,
             git::get_git_panel_context,
+            git::get_working_tree_status,
+            git::git_stage_files,
+            git::git_unstage_files,
+            git::git_discard_files,
+            git::git_commit,
+            git::get_commit_log,
+            git::get_stash_list,
+            git::git_stash_apply,
+            git::git_stash_pop,
+            git::git_stash_drop,
+            git::git_stash_show,
+            git::get_file_history,
+            git::get_file_blame,
             github::check_github_circuit,
             github::get_ci_checks,
             github::get_repo_pr_statuses,
@@ -813,6 +847,7 @@ pub fn run() {
             get_local_ips,
             updater::check_update_channel,
             get_mcp_status,
+            get_connect_url,
             regenerate_session_token,
             get_relay_status,
             dictation::commands::get_dictation_status,
@@ -837,6 +872,7 @@ pub fn run() {
             config::save_ui_prefs,
             config::load_repo_settings,
             config::save_repo_settings,
+            config::load_repo_local_config,
             mcp_upstream_config::load_mcp_upstreams,
             mcp_upstream_config::save_mcp_upstreams,
             mcp_upstream_config::reconnect_mcp_upstream,
@@ -852,6 +888,9 @@ pub fn run() {
             config::save_prompt_library,
             config::load_notes,
             config::save_notes,
+            config::save_note_image,
+            config::delete_note_assets,
+            config::get_note_images_dir,
             config::load_activity,
             config::save_activity,
             config::load_keybindings,
@@ -891,6 +930,8 @@ pub fn run() {
             plugins::install_plugin_from_folder,
             plugins::install_plugin_from_url,
             plugins::uninstall_plugin,
+            plugins::register_loaded_plugin,
+            plugins::unregister_loaded_plugin,
             plugin_fs::plugin_read_file,
             plugin_fs::plugin_list_directory,
             plugin_fs::plugin_read_file_tail,
@@ -909,7 +950,8 @@ pub fn run() {
             app_logger::push_log,
             app_logger::get_logs,
             app_logger::clear_logs,
-            notification_sound::play_notification_sound
+            notification_sound::play_notification_sound,
+            git_graph::get_commit_graph
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -943,5 +985,41 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+/// Build a connect URL for QR-code authentication.
+/// Brackets IPv6 addresses for valid URL syntax.
+fn build_connect_url(ip: &str, port: u16, token: &str) -> String {
+    let host = if ip.contains(':') { format!("[{ip}]") } else { ip.to_string() };
+    format!("http://{host}:{port}/?token={token}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_connect_url_ipv4() {
+        assert_eq!(
+            build_connect_url("192.168.1.1", 8080, "abc-123"),
+            "http://192.168.1.1:8080/?token=abc-123"
+        );
+    }
+
+    #[test]
+    fn build_connect_url_ipv6() {
+        assert_eq!(
+            build_connect_url("fe80::1", 9443, "tok"),
+            "http://[fe80::1]:9443/?token=tok"
+        );
+    }
+
+    #[test]
+    fn build_connect_url_localhost() {
+        assert_eq!(
+            build_connect_url("127.0.0.1", 3000, "t"),
+            "http://127.0.0.1:3000/?token=t"
+        );
+    }
 }
 

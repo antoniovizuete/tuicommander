@@ -177,9 +177,7 @@ impl GitHubCircuitBreaker {
     pub(crate) fn record_rate_limit(&self, wait_secs: u64) {
         let delay = std::time::Duration::from_secs(wait_secs);
         *self.rate_limit_until.write() = Some(Instant::now() + delay);
-        eprintln!(
-            "[github] Rate limited — backing off for {wait_secs}s",
-        );
+        tracing::warn!(source = "github", backoff_secs = wait_secs, "Rate limited — backing off");
     }
 
     /// Record a failed API call. Opens the circuit after threshold failures.
@@ -194,10 +192,7 @@ impl GitHubCircuitBreaker {
             );
             let delay = std::time::Duration::from_millis(delay_ms as u64);
             *self.open_until.write() = Some(Instant::now() + delay);
-            eprintln!(
-                "[github] Circuit breaker open after {count} failures, backing off for {:.1}s",
-                delay.as_secs_f64()
-            );
+            tracing::warn!(source = "github", failures = count, backoff_secs = delay.as_secs_f64(), "Circuit breaker open");
         }
     }
 }
@@ -234,15 +229,56 @@ pub(crate) fn parse_remote_url(url: &str) -> Option<(String, String)> {
 }
 
 /// Parse a header value as a u64, returning None if missing or unparseable.
-fn header_as_u64(response: &reqwest::blocking::Response, name: &str) -> Option<u64> {
-    response.headers().get(name)?.to_str().ok()?.parse().ok()
+fn header_as_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    headers.get(name)?.to_str().ok()?.parse().ok()
+}
+
+/// Check a GraphQL JSON response for errors.
+///
+/// - Rate-limited errors always fail.
+/// - Non-rate-limit errors fail only when `data` is absent (pure error).
+///   When `data` is present alongside errors (partial success, e.g. one repo
+///   not found in a batch query), the caller receives `Ok(())` so it can
+///   process the valid portion.  The `get_all_pr_statuses_impl` loop already
+///   handles null repos gracefully.
+pub(crate) fn check_graphql_errors(
+    json: &serde_json::Value,
+    ratelimit_reset: Option<u64>,
+    retry_after: Option<u64>,
+) -> Result<(), GqlError> {
+    let errors = match json["errors"].as_array() {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return Ok(()),
+    };
+
+    // Rate-limit errors always bubble up — partial data is stale anyway
+    let has_rate_limit_error = errors.iter().any(|e| {
+        e["type"].as_str() == Some("RATE_LIMITED")
+    });
+    if has_rate_limit_error {
+        let msg = errors[0]["message"].as_str().unwrap_or("GraphQL rate limit");
+        return Err(GqlError::RateLimit {
+            reset_at: ratelimit_reset,
+            retry_after,
+            message: msg.to_string(),
+        });
+    }
+
+    // If the response includes valid data alongside the errors, treat as
+    // partial success — the caller will skip null repos individually.
+    if json["data"].is_object() {
+        return Ok(());
+    }
+
+    let msg = errors[0]["message"].as_str().unwrap_or("Unknown GraphQL error");
+    Err(GqlError::Other(format!("GraphQL error: {msg}")))
 }
 
 /// Execute a GraphQL query against the GitHub API.
 /// Returns the parsed JSON response or a typed error.
 /// Detects rate limits from HTTP status codes, headers, and GraphQL error types.
-pub(crate) fn graphql_request(
-    client: &reqwest::blocking::Client,
+pub(crate) async fn graphql_request(
+    client: &reqwest::Client,
     token: &str,
     query: &str,
     variables: &serde_json::Value,
@@ -258,14 +294,15 @@ pub(crate) fn graphql_request(
         .header("User-Agent", "tuicommander")
         .json(&body)
         .send()
+        .await
         .map_err(|e| GqlError::Other(format!("GraphQL request failed: {e}")))?;
 
     let status = response.status();
 
     // Extract rate limit headers before consuming the response body
-    let ratelimit_remaining = header_as_u64(&response, "x-ratelimit-remaining");
-    let ratelimit_reset = header_as_u64(&response, "x-ratelimit-reset");
-    let retry_after = header_as_u64(&response, "retry-after");
+    let ratelimit_remaining = header_as_u64(response.headers(), "x-ratelimit-remaining");
+    let ratelimit_reset = header_as_u64(response.headers(), "x-ratelimit-reset");
+    let retry_after = header_as_u64(response.headers(), "retry-after");
 
     // 1. HTTP 429 → always a rate limit
     if status.as_u16() == 429 {
@@ -278,6 +315,7 @@ pub(crate) fn graphql_request(
 
     let json: serde_json::Value = response
         .json()
+        .await
         .map_err(|e| GqlError::Other(format!("Failed to parse GraphQL response: {e}")))?;
 
     if !status.is_success() {
@@ -312,26 +350,8 @@ pub(crate) fn graphql_request(
         return Err(GqlError::Other(err_msg));
     }
 
-    // 4. HTTP 200 + GraphQL errors with type "RATE_LIMITED"
-    if let Some(errors) = json["errors"].as_array()
-        && !errors.is_empty()
-    {
-        let has_rate_limit_error = errors.iter().any(|e| {
-            e["type"].as_str() == Some("RATE_LIMITED")
-        });
-
-        if has_rate_limit_error {
-            let msg = errors[0]["message"].as_str().unwrap_or("GraphQL rate limit");
-            return Err(GqlError::RateLimit {
-                reset_at: ratelimit_reset,
-                retry_after,
-                message: msg.to_string(),
-            });
-        }
-
-        let msg = errors[0]["message"].as_str().unwrap_or("Unknown GraphQL error");
-        return Err(GqlError::Other(format!("GraphQL error: {msg}")));
-    }
+    // 4. HTTP 200 + GraphQL errors
+    check_graphql_errors(&json, ratelimit_reset, retry_after)?;
 
     Ok(json)
 }
@@ -358,7 +378,7 @@ fn rate_limit_wait_secs(reset_at: Option<u64>, retry_after: Option<u64>) -> u64 
 /// Execute a GraphQL query with token fallback and circuit breaker protection.
 /// On 401, tries remaining token candidates and updates the stored token on success.
 /// Rate limits are handled separately from failures — they don't inflate the failure count.
-pub(crate) fn graphql_with_retry(
+pub(crate) async fn graphql_with_retry(
     state: &AppState,
     query: &str,
     variables: serde_json::Value,
@@ -372,7 +392,7 @@ pub(crate) fn graphql_with_retry(
         None => return Err("No GitHub token available".to_string()),
     };
 
-    match graphql_request(&state.http_client, &token, query, &variables) {
+    match graphql_request(&state.http_client, &token, query, &variables).await {
         Ok(response) => {
             state.github_circuit_breaker.record_success();
             Ok(response)
@@ -383,16 +403,16 @@ pub(crate) fn graphql_with_retry(
             Err(format!("rate-limit: {message}"))
         }
         Err(GqlError::Auth(msg)) => {
-            eprintln!("[github] 401 with current token, trying fallback candidates");
+            tracing::warn!(source = "github", "401 with current token, trying fallback candidates");
             // Try other candidates
             let candidates = resolve_github_token_candidates();
             for candidate in &candidates {
                 if candidate == &token {
                     continue; // Skip the one that already failed
                 }
-                match graphql_request(&state.http_client, candidate, query, &variables) {
+                match graphql_request(&state.http_client, candidate, query, &variables).await {
                     Ok(response) => {
-                        eprintln!("[github] Token fallback succeeded");
+                        tracing::info!(source = "github", "Token fallback succeeded");
                         *state.github_token.write() = Some(candidate.clone());
                         state.github_circuit_breaker.record_success();
                         return Ok(response);
@@ -758,7 +778,7 @@ fn get_github_remote_url(repo_path: &Path) -> Option<String> {
 
 /// Core logic for fetching PR statuses via GitHub GraphQL API (no caching).
 /// Returns Err for rate limits (prefixed with "rate-limit:") so callers can handle them.
-pub(crate) fn get_repo_pr_statuses_impl(
+pub(crate) async fn get_repo_pr_statuses_impl(
     path: &str,
     include_merged: bool,
     state: &AppState,
@@ -783,7 +803,7 @@ pub(crate) fn get_repo_pr_statuses_impl(
     let repos = vec![(path.to_string(), owner, repo)];
     let (query, aliases) = build_multi_repo_pr_query(&repos, include_merged);
 
-    match graphql_with_retry(state, &query, serde_json::Value::Null) {
+    match graphql_with_retry(state, &query, serde_json::Value::Null).await {
         Ok(response) => {
             let alias = &aliases[0].0;
             let repo_json = &response["data"][alias];
@@ -812,14 +832,13 @@ pub(crate) fn get_repo_pr_statuses_impl(
         }
         Err(e) if e.starts_with("rate-limit:") => Err(e),
         Err(e) => {
-            eprintln!("[github] GraphQL PR query failed for {path}: {e}");
+            tracing::warn!(source = "github", %path, "GraphQL PR query failed: {e}");
             Ok(vec![])
         }
     }
 }
 
 /// Get PR statuses for a repository (cached, 30s TTL).
-/// Runs on a blocking thread to avoid freezing the UI on focus.
 #[tauri::command]
 pub(crate) async fn get_repo_pr_statuses(
     state: State<'_, Arc<AppState>>,
@@ -828,20 +847,16 @@ pub(crate) async fn get_repo_pr_statuses(
 ) -> Result<Vec<BranchPrStatus>, String> {
     let include_merged = include_merged.unwrap_or(false);
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || {
-        // Skip cache when include_merged is true (startup poll only)
-        if !include_merged
-            && let Some(cached) = AppState::get_cached(&state.git_cache.github_status, &path, GITHUB_CACHE_TTL)
-        {
-            return Ok(cached);
-        }
+    // Skip cache when include_merged is true (startup poll only)
+    if !include_merged
+        && let Some(cached) = AppState::get_cached(&state.git_cache.github_status, &path, GITHUB_CACHE_TTL)
+    {
+        return Ok(cached);
+    }
 
-        let statuses = get_repo_pr_statuses_impl(&path, include_merged, &state)?;
-        AppState::set_cached(&state.git_cache.github_status, path.clone(), statuses.clone());
-        Ok(statuses)
-    })
-    .await
-    .map_err(|e| format!("Task failed: {e}"))?
+    let statuses = get_repo_pr_statuses_impl(&path, include_merged, &state).await?;
+    AppState::set_cached(&state.git_cache.github_status, path.clone(), statuses.clone());
+    Ok(statuses)
 }
 
 /// Read local branch tips (name → commit SHA) via `git for-each-ref`.
@@ -906,7 +921,7 @@ fn build_multi_repo_pr_query(
 
 /// Fetch PR statuses for all repos in a single batched GraphQL call.
 /// On failure (network, auth, complexity), returns Err so the caller can fall back to per-repo calls.
-pub(crate) fn get_all_pr_statuses_impl(
+pub(crate) async fn get_all_pr_statuses_impl(
     paths: &[String],
     include_merged: bool,
     state: &AppState,
@@ -915,6 +930,10 @@ pub(crate) fn get_all_pr_statuses_impl(
         return Ok(std::collections::HashMap::new());
     }
 
+    // Evict expired cooldowns before filtering
+    let now = Instant::now();
+    state.git_cache.github_repo_cooldown.retain(|_key, expiry| *expiry > now);
+
     // Resolve (path, owner, repo) for each path that has a GitHub remote
     let repos: Vec<(String, String, String)> = paths
         .iter()
@@ -922,6 +941,11 @@ pub(crate) fn get_all_pr_statuses_impl(
             let repo_path = PathBuf::from(path);
             let url = get_github_remote_url(&repo_path)?;
             let (owner, name) = parse_remote_url(&url)?;
+            // Skip repos in cooldown (not found on GitHub)
+            let cooldown_key = format!("{owner}/{name}");
+            if state.git_cache.github_repo_cooldown.contains_key(&cooldown_key) {
+                return None;
+            }
             Some((path.clone(), owner, name))
         })
         .collect();
@@ -932,14 +956,39 @@ pub(crate) fn get_all_pr_statuses_impl(
 
     let (query, aliases) = build_multi_repo_pr_query(&repos, include_merged);
 
-    let response = graphql_with_retry(state, &query, serde_json::Value::Null)?;
+    let response = graphql_with_retry(state, &query, serde_json::Value::Null).await?;
+
+    // Build alias→(owner, name) lookup for logging null repos
+    let alias_repo_names: std::collections::HashMap<&str, (&str, &str)> = repos
+        .iter()
+        .enumerate()
+        .map(|(i, (_path, owner, name))| {
+            // aliases are "r0", "r1", … matching the enumerate index
+            let alias_key: &str = aliases[i].0.as_str();
+            (alias_key, (owner.as_str(), name.as_str()))
+        })
+        .collect();
 
     let mut results = std::collections::HashMap::new();
     for (alias, path) in &aliases {
         let repo_json = &response["data"][alias];
         let nodes = match repo_json["pullRequests"]["nodes"].as_array() {
             Some(arr) => arr,
-            None => continue,
+            None => {
+                // Null repo — likely doesn't exist on GitHub.
+                // Add to 1-hour cooldown so future batch polls skip it.
+                if repo_json.is_null()
+                    && let Some((owner, name)) = alias_repo_names.get(alias.as_str())
+                {
+                    let cooldown_key = format!("{owner}/{name}");
+                    let expiry = Instant::now() + std::time::Duration::from_secs(3600);
+                    state.git_cache.github_repo_cooldown.insert(cooldown_key, expiry);
+                    let msg = format!("Repository {owner}/{name} not found on GitHub — cooldown 1h");
+                    let mut buf = state.log_buffer.lock();
+                    buf.push("warn".into(), "github".into(), msg, None);
+                }
+                continue;
+            }
         };
         let mut statuses: Vec<BranchPrStatus> = nodes.iter().filter_map(parse_pr_node).collect();
         stamp_merge_policy(&mut statuses, repo_json);
@@ -977,11 +1026,7 @@ pub(crate) async fn get_all_pr_statuses(
     include_merged: bool,
 ) -> Result<std::collections::HashMap<String, Vec<BranchPrStatus>>, String> {
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || {
-        get_all_pr_statuses_impl(&paths, include_merged, &state)
-    })
-    .await
-    .map_err(|e| format!("Task failed: {e}"))?
+    get_all_pr_statuses_impl(&paths, include_merged, &state).await
 }
 
 /// Get git remote + branch status for a repository (implementation).
@@ -1124,7 +1169,7 @@ fn parse_pr_check_contexts(data: &serde_json::Value) -> Vec<serde_json::Value> {
 }
 
 /// Core logic for fetching CI check details via GitHub GraphQL API (no caching).
-pub(crate) fn get_ci_checks_impl(
+pub(crate) async fn get_ci_checks_impl(
     path: &str,
     pr_number: i64,
     state: &AppState,
@@ -1151,17 +1196,17 @@ pub(crate) fn get_ci_checks_impl(
         "number": pr_number,
     });
 
-    match graphql_with_retry(state, PR_CHECKS_QUERY, variables) {
+    match graphql_with_retry(state, PR_CHECKS_QUERY, variables).await {
         Ok(data) => parse_pr_check_contexts(&data),
         Err(e) => {
-            eprintln!("[github] GraphQL PR checks query failed: {}", e);
+            tracing::warn!(source = "github", "GraphQL PR checks query failed: {e}");
             vec![]
         }
     }
 }
 
 /// Merge a PR via GitHub REST API using the specified merge method.
-pub(crate) fn merge_pr_github_impl(
+pub(crate) async fn merge_pr_github_impl(
     repo_path: &str,
     pr_number: i64,
     merge_method: &str,
@@ -1190,11 +1235,13 @@ pub(crate) fn merge_pr_github_impl(
         .header("Accept", "application/vnd.github+json")
         .json(&body)
         .send()
+        .await
         .map_err(|e| format!("GitHub API request failed: {e}"))?;
 
     let status = response.status().as_u16();
     let json: serde_json::Value = response
         .json()
+        .await
         .map_err(|e| format!("Failed to parse GitHub API response: {e}"))?;
 
     if (200..300).contains(&status) {
@@ -1215,15 +1262,10 @@ pub(crate) async fn merge_pr_via_github(
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || {
-        merge_pr_github_impl(&repo_path, pr_number, &merge_method, &state)
-    })
-    .await
-    .map_err(|e| format!("Task failed: {e}"))?
+    merge_pr_github_impl(&repo_path, pr_number, &merge_method, &state).await
 }
 
 /// Get CI check details for a PR via GitHub GraphQL API (Story 060).
-/// Runs on a blocking thread to avoid freezing the UI on focus.
 #[tauri::command]
 pub(crate) async fn get_ci_checks(
     path: String,
@@ -1231,16 +1273,12 @@ pub(crate) async fn get_ci_checks(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || {
-        get_ci_checks_impl(&path, pr_number, &state)
-    })
-    .await
-    .map_err(|e| format!("Task failed: {e}"))
+    Ok(get_ci_checks_impl(&path, pr_number, &state).await)
 }
 
 /// Approve a PR via GitHub REST API.
 /// Creates a review with event=APPROVE.
-pub(crate) fn approve_pr_impl(
+pub(crate) async fn approve_pr_impl(
     repo_path: &str,
     pr_number: i64,
     state: &AppState,
@@ -1268,6 +1306,7 @@ pub(crate) fn approve_pr_impl(
         .header("Accept", "application/vnd.github+json")
         .json(&body)
         .send()
+        .await
         .map_err(|e| format!("GitHub API request failed: {e}"))?;
 
     let status = response.status();
@@ -1276,6 +1315,7 @@ pub(crate) fn approve_pr_impl(
     } else {
         let json: serde_json::Value = response
             .json()
+            .await
             .unwrap_or_else(|_| serde_json::json!({"message": "Unknown error"}));
         let msg = json["message"].as_str().unwrap_or("Unknown error");
         Err(format!("GitHub approve failed ({status}): {msg}"))
@@ -1290,14 +1330,12 @@ pub(crate) async fn approve_pr(
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || approve_pr_impl(&repo_path, pr_number, &state))
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
+    approve_pr_impl(&repo_path, pr_number, &state).await
 }
 
 /// Fetch the unified diff for a PR via GitHub REST API.
 /// Uses Accept: application/vnd.github.diff to get raw diff text.
-pub(crate) fn get_pr_diff_impl(
+pub(crate) async fn get_pr_diff_impl(
     repo_path: &str,
     pr_number: i64,
     state: &AppState,
@@ -1323,15 +1361,17 @@ pub(crate) fn get_pr_diff_impl(
         .header("User-Agent", "tuicommander")
         .header("Accept", "application/vnd.github.diff")
         .send()
+        .await
         .map_err(|e| format!("GitHub API request failed: {e}"))?;
 
     let status = response.status();
     if status.is_success() {
         response
             .text()
+            .await
             .map_err(|e| format!("Failed to read diff body: {e}"))
     } else {
-        let body = response.text().unwrap_or_default();
+        let body = response.text().await.unwrap_or_default();
         Err(format!("GitHub diff request failed ({status}): {body}"))
     }
 }
@@ -1344,9 +1384,7 @@ pub(crate) async fn get_pr_diff(
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || get_pr_diff_impl(&repo_path, pr_number, &state))
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
+    get_pr_diff_impl(&repo_path, pr_number, &state).await
 }
 
 #[cfg(test)]
@@ -2005,9 +2043,9 @@ mod tests {
     /// Test that our GraphQL batch PR query returns the same data as `gh pr list`.
     /// Compares owner/repo extraction, token resolution, API call, and parsed results
     /// against the gh CLI output on this repository.
-    #[test]
+    #[tokio::test]
     #[ignore] // Requires network + GitHub token
-    fn test_graphql_pr_query_matches_gh_cli() {
+    async fn test_graphql_pr_query_matches_gh_cli() {
         // 1. Resolve token (same path our production code uses)
         let token = resolve_github_token()
             .expect("No GitHub token found — set GH_TOKEN or run `gh auth login`");
@@ -2023,13 +2061,13 @@ mod tests {
         println!("Testing against {owner}/{repo}");
 
         // 3. Call GraphQL API
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::Client::new();
         let variables = serde_json::json!({
             "owner": owner,
             "repo": repo,
             "first": 50,
         });
-        let graphql_result = graphql_request(&client, &token, BATCH_PR_QUERY, &variables);
+        let graphql_result = graphql_request(&client, &token, BATCH_PR_QUERY, &variables).await;
         assert!(graphql_result.is_ok(), "GraphQL request failed: {:?}", graphql_result.err());
 
         let data = graphql_result.unwrap();
@@ -2103,19 +2141,19 @@ mod tests {
     }
 
     /// Test that GraphQL token resolution works and can authenticate.
-    #[test]
+    #[tokio::test]
     #[ignore] // Requires network + GitHub token
-    fn test_graphql_auth_and_rate_limit() {
+    async fn test_graphql_auth_and_rate_limit() {
         let token = resolve_github_token()
             .expect("No GitHub token found");
 
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::Client::new();
         // Minimal query just to verify auth works
         let result = graphql_request(
             &client, &token,
             "query { viewer { login } rateLimit { remaining resetAt } }",
             &serde_json::json!({}),
-        );
+        ).await;
 
         assert!(result.is_ok(), "Auth failed: {:?}", result.err());
         let data = result.unwrap();
@@ -2208,9 +2246,9 @@ mod tests {
     /// by falling through to `gh auth token` CLI.
     /// This catches the exact bug where GITHUB_TOKEN="" in Tauri GUI processes
     /// caused gh_token crate to return an empty string → 401 Bad credentials.
-    #[test]
+    #[tokio::test]
     #[ignore] // Requires gh CLI authenticated
-    fn test_resolve_token_with_empty_env_falls_through_to_cli() {
+    async fn test_resolve_token_with_empty_env_falls_through_to_cli() {
         // Save and clear env vars to simulate GUI context
         let saved_gh = std::env::var("GH_TOKEN").ok();
         let saved_github = std::env::var("GITHUB_TOKEN").ok();
@@ -2226,12 +2264,12 @@ mod tests {
         assert!(!token.is_empty(), "Token from CLI should not be empty");
 
         // Verify the token actually works against GitHub API
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::Client::new();
         let result = graphql_request(
             &client, &token,
             "query { viewer { login } }",
             &serde_json::json!({}),
-        );
+        ).await;
         assert!(result.is_ok(),
             "Token from gh CLI should authenticate successfully: {:?}", result.err());
 
@@ -2399,5 +2437,108 @@ mod tests {
     fn test_rate_limit_wait_secs_reset_in_past() {
         // If reset_at is in the past and no retry-after, default to 60
         assert_eq!(rate_limit_wait_secs(Some(1000), None), 60);
+    }
+
+    // --- check_graphql_errors tests ---
+
+    #[test]
+    fn test_check_graphql_errors_no_errors_returns_ok() {
+        let json = serde_json::json!({
+            "data": { "r0": { "pullRequests": { "nodes": [] } } }
+        });
+        assert!(check_graphql_errors(&json, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_check_graphql_errors_empty_errors_array_returns_ok() {
+        let json = serde_json::json!({
+            "data": { "r0": null },
+            "errors": []
+        });
+        assert!(check_graphql_errors(&json, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_check_graphql_errors_rate_limited_always_fails() {
+        let json = serde_json::json!({
+            "data": { "r0": { "pullRequests": { "nodes": [] } } },
+            "errors": [{ "type": "RATE_LIMITED", "message": "rate limited" }]
+        });
+        let err = check_graphql_errors(&json, Some(9999), None).unwrap_err();
+        assert!(matches!(err, GqlError::RateLimit { .. }));
+    }
+
+    #[test]
+    fn test_check_graphql_errors_partial_data_returns_ok() {
+        // Errors + data present → partial success, should return Ok
+        let json = serde_json::json!({
+            "data": {
+                "r0": { "pullRequests": { "nodes": [] } },
+                "r1": null
+            },
+            "errors": [{
+                "type": "NOT_FOUND",
+                "message": "Could not resolve to a Repository with the name 'foo/bar'."
+            }]
+        });
+        assert!(check_graphql_errors(&json, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_check_graphql_errors_no_data_returns_err() {
+        // Errors without data → pure error
+        let json = serde_json::json!({
+            "errors": [{ "message": "Something went wrong" }]
+        });
+        let err = check_graphql_errors(&json, None, None).unwrap_err();
+        match err {
+            GqlError::Other(msg) => assert!(msg.contains("Something went wrong")),
+            _ => panic!("Expected GqlError::Other, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_graphql_errors_data_null_returns_err() {
+        // data: null is not a valid object — treat as pure error
+        let json = serde_json::json!({
+            "data": null,
+            "errors": [{ "message": "Bad query" }]
+        });
+        let err = check_graphql_errors(&json, None, None).unwrap_err();
+        assert!(matches!(err, GqlError::Other(_)));
+    }
+
+    // --- github_repo_cooldown tests ---
+
+    #[test]
+    fn test_cooldown_evicts_expired_entries() {
+        let cache = crate::state::GitCacheState::new();
+        // Insert an already-expired entry
+        cache.github_repo_cooldown.insert(
+            "owner/expired".to_string(),
+            Instant::now() - std::time::Duration::from_secs(1),
+        );
+        // Insert a still-valid entry
+        cache.github_repo_cooldown.insert(
+            "owner/active".to_string(),
+            Instant::now() + std::time::Duration::from_secs(3600),
+        );
+        // Evict expired
+        let now = Instant::now();
+        cache.github_repo_cooldown.retain(|_k, expiry| *expiry > now);
+
+        assert!(!cache.github_repo_cooldown.contains_key("owner/expired"));
+        assert!(cache.github_repo_cooldown.contains_key("owner/active"));
+    }
+
+    #[test]
+    fn test_cooldown_cleared_by_clear_all() {
+        let cache = crate::state::GitCacheState::new();
+        cache.github_repo_cooldown.insert(
+            "owner/repo".to_string(),
+            Instant::now() + std::time::Duration::from_secs(3600),
+        );
+        cache.clear_all();
+        assert!(cache.github_repo_cooldown.is_empty());
     }
 }

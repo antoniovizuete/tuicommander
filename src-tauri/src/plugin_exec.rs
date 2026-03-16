@@ -167,6 +167,18 @@ pub async fn plugin_exec_cli(
     args: Vec<String>,
     cwd: Option<String>,
     plugin_id: String,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
+) -> Result<String, String> {
+    crate::plugins::check_plugin_capability(&state, &plugin_id, "exec:cli")?;
+    plugin_exec_cli_inner(binary, args, cwd, plugin_id).await
+}
+
+/// Core exec logic, separated from the Tauri command wrapper for testability.
+async fn plugin_exec_cli_inner(
+    binary: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    plugin_id: String,
 ) -> Result<String, String> {
     // Rate limit per plugin
     check_rate_limit(&plugin_id)?;
@@ -218,9 +230,11 @@ pub async fn plugin_exec_cli(
 
     let duration_ms = start.elapsed().as_millis();
     let exit_ok = result.status.success();
-    eprintln!(
-        "[plugin_exec] plugin={} binary={} arg0={} duration={}ms ok={}",
-        plugin_id, binary, first_arg, duration_ms, exit_ok
+    tracing::debug!(
+        source = "plugin_exec",
+        plugin = %plugin_id, binary = %binary, arg0 = %first_arg,
+        duration_ms = duration_ms, ok = exit_ok,
+        "Plugin exec completed"
     );
 
     if !result.status.success() {
@@ -334,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_rejects_unlisted_binary() {
-        let result = plugin_exec_cli(
+        let result = plugin_exec_cli_inner(
             "curl".to_string(),
             vec![],
             None,
@@ -349,7 +363,7 @@ mod tests {
     async fn exec_rejects_nonexistent_binary() {
         let result = resolve_binary("mdkb");
         if result.is_none() {
-            let r = plugin_exec_cli(
+            let r = plugin_exec_cli_inner(
                 "mdkb".to_string(),
                 vec![],
                 None,
